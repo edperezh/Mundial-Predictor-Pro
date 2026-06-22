@@ -1,0 +1,9 @@
+pandas
+numpy
+requests
+scipy
+scikit-learn
+matplotlib
+streamlit
+# Opcional:
+# xgboost
