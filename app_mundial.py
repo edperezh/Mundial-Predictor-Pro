@@ -1038,6 +1038,99 @@ def update_elo(r_a, r_b, goals_a, goals_b, tournament, neutral=True):
     return r_a + change, r_b - change
 
 
+
+def safe_streamlit_df(df):
+    """
+    Evita errores de PyArrow/Streamlit cuando una columna mezcla números y textos.
+    Ejemplo: columna 'Valor' con 7.2 y 'Fase de grupos'.
+    """
+    if not isinstance(df, pd.DataFrame):
+        return df
+    out = df.copy()
+    for col in out.columns:
+        try:
+            type_count = out[col].dropna().map(lambda x: type(x).__name__).nunique()
+            if out[col].dtype == "object" or type_count > 1:
+                out[col] = out[col].map(lambda x: "" if pd.isna(x) else str(x))
+        except Exception:
+            out[col] = out[col].astype(str)
+    return out
+
+
+def safe_streak_stats(mem, team, n=10):
+    """
+    Compatibilidad para sesiones antiguas de Streamlit.
+    Si st.session_state.mem fue creado antes de la V21, puede no tener streak_stats.
+    """
+    try:
+        if hasattr(mem, "streak_stats"):
+            return mem.streak_stats(team, n)
+    except Exception:
+        pass
+
+    try:
+        mem.ensure_team(team)
+        hist = getattr(mem, "matches", {}).get(team, [])
+    except Exception:
+        hist = []
+
+    if not hist:
+        return {
+            f"win_streak_last{n}": 0,
+            f"unbeaten_streak_last{n}": 0,
+            f"no_score_streak_last{n}": 0,
+            f"clean_sheet_streak_last{n}": 0,
+            f"draw_rate_last{n}": 0.25,
+            f"low_score_rate_last{n}": 0.45,
+        }
+
+    last = hist[-n:]
+
+    def points(m):
+        return float(m.get("points", 0))
+
+    win_streak = 0
+    for m in reversed(last):
+        if points(m) == 3:
+            win_streak += 1
+        else:
+            break
+
+    unbeaten_streak = 0
+    for m in reversed(last):
+        if points(m) >= 1:
+            unbeaten_streak += 1
+        else:
+            break
+
+    no_score_streak = 0
+    for m in reversed(last):
+        if float(m.get("gf", 0)) == 0:
+            no_score_streak += 1
+        else:
+            break
+
+    clean_sheet_streak = 0
+    for m in reversed(last):
+        if float(m.get("ga", 0)) == 0:
+            clean_sheet_streak += 1
+        else:
+            break
+
+    draws = [1 if points(m) == 1 else 0 for m in last]
+    low_scores = [1 if (float(m.get("gf", 0)) + float(m.get("ga", 0))) <= 2 else 0 for m in last]
+
+    return {
+        f"win_streak_last{n}": int(win_streak),
+        f"unbeaten_streak_last{n}": int(unbeaten_streak),
+        f"no_score_streak_last{n}": int(no_score_streak),
+        f"clean_sheet_streak_last{n}": int(clean_sheet_streak),
+        f"draw_rate_last{n}": float(np.mean(draws)) if draws else 0.25,
+        f"low_score_rate_last{n}": float(np.mean(low_scores)) if low_scores else 0.45,
+    }
+
+
+
 class TeamMemory:
     """
     Guarda historial previo de cada selección para calcular features antes de cada partido.
@@ -2643,10 +2736,10 @@ def build_future_match_features(mem, history_df, team_a, team_b, neutral=True, t
     away10 = mem.rolling_stats(team_b, None, 10)
     home20 = mem.rolling_stats(team_a, None, 20)
     away20 = mem.rolling_stats(team_b, None, 20)
-    home_streak10 = mem.streak_stats(team_a, 10)
-    away_streak10 = mem.streak_stats(team_b, 10)
-    home_streak20 = mem.streak_stats(team_a, 20)
-    away_streak20 = mem.streak_stats(team_b, 20)
+    home_streak10 = safe_streak_stats(mem, team_a, 10)
+    away_streak10 = safe_streak_stats(mem, team_b, 10)
+    home_streak20 = safe_streak_stats(mem, team_a, 20)
+    away_streak20 = safe_streak_stats(mem, team_b, 20)
 
     h2h = h2h_stats(history_df, team_a, team_b, 5)
     venue = compute_worldcup_host_advantage(team_a, team_b, sede_pais=sede_pais)
@@ -5124,7 +5217,7 @@ def streamlit_app():
             {"Variable": f"Necesidad de ganar {team_a}", "Valor": advanced_context["urgency_a"]},
             {"Variable": f"Necesidad de ganar {team_b}", "Valor": advanced_context["urgency_b"]},
         ])
-        st.dataframe(values_df, use_container_width=True, hide_index=True)
+        st.dataframe(safe_streamlit_df(values_df), use_container_width=True, hide_index=True)
 
         st.markdown("**Fuentes y diagnóstico de actualización**")
         diag_df = pd.DataFrame([
@@ -5145,7 +5238,7 @@ def streamlit_app():
             {"Fuente": "API-Football error/plan", "Detalle": str(auto_sources.get("api_error"))},
             {"Fuente": "Alineaciones API usadas", "Detalle": str(auto_sources.get("api_lineups_used"))},
         ])
-        st.dataframe(diag_df, use_container_width=True, hide_index=True)
+        st.dataframe(safe_streamlit_df(diag_df), use_container_width=True, hide_index=True)
 
     prediction = predict_match(training_result, mem, results, team_a, team_b, sede_pais=sede_pais, advanced_context=advanced_context)
     probs = prediction["probs"]
@@ -5158,7 +5251,7 @@ def streamlit_app():
     q1, q2 = st.columns([1, 3])
     q1.metric("Calidad de datos", f"{quality_score}/100", quality_label)
     with q2.expander("Ver diagnóstico de calidad de datos"):
-        st.dataframe(quality_details, use_container_width=True, hide_index=True)
+        st.dataframe(safe_streamlit_df(quality_details), use_container_width=True, hide_index=True)
     st.info(
         f"País sede seleccionado: {sede_pais}. "
         "La ventaja de anfitrión solo se activa si el equipo es United States, Mexico o Canada "
@@ -5184,7 +5277,7 @@ def streamlit_app():
         st.subheader("Marcadores más probables")
         top = prediction["top_scores"][["marcador", "probabilidad_%"]].copy()
         top["probabilidad_%"] = top["probabilidad_%"].map(lambda x: f"{x:.2f}%")
-        st.dataframe(top, use_container_width=True, hide_index=True)
+        st.dataframe(safe_streamlit_df(top), use_container_width=True, hide_index=True)
 
     with right:
         st.subheader("Comparación de rendimiento")
@@ -5243,7 +5336,7 @@ def streamlit_app():
             show_df["GC últimos 10"] = show_df["GC últimos 10"].map(lambda x: round(float(x), 2))
             show_df["Puntos prom. últimos 10"] = show_df["Puntos prom. últimos 10"].map(lambda x: round(float(x), 2))
 
-            st.dataframe(show_df, use_container_width=True, hide_index=True)
+            st.dataframe(safe_streamlit_df(show_df), use_container_width=True, hide_index=True)
 
         with col_prob_2:
             top_n = st.slider("Cantidad de equipos en barras", 8, 32, 16)
@@ -5276,7 +5369,7 @@ def streamlit_app():
             mc_show = mc_df[["ranking_mc", "equipo_es", "prob_campeon_montecarlo_%", "campeon_simulaciones"]].copy()
             mc_show.columns = ["Ranking MC", "Equipo", "Prob. campeón Monte Carlo (%)", "Veces campeón"]
             mc_show["Prob. campeón Monte Carlo (%)"] = mc_show["Prob. campeón Monte Carlo (%)"].map(lambda x: f"{x:.2f}%")
-            st.dataframe(mc_show, use_container_width=True, hide_index=True)
+            st.dataframe(safe_streamlit_df(mc_show), use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("Curva de rendimiento durante el Mundial")
@@ -5302,7 +5395,7 @@ def streamlit_app():
             curve_show.columns = ["Momento", "Equipo", "Rendimiento 0-100", "Elo", "PTS", "DG", "PJ"]
             curve_show["Rendimiento 0-100"] = curve_show["Rendimiento 0-100"].map(lambda x: round(float(x), 2))
             curve_show["Elo"] = curve_show["Elo"].map(lambda x: round(float(x), 1))
-            st.dataframe(curve_show, use_container_width=True, hide_index=True)
+            st.dataframe(safe_streamlit_df(curve_show), use_container_width=True, hide_index=True)
 
 
 
@@ -5362,7 +5455,7 @@ def streamlit_app():
             for col in ["Acierto 1X2", "Acierto marcador top1", "Acierto marcador top3"]:
                 if col in show_acc.columns:
                     show_acc[col] = show_acc[col].map(lambda x: "✅" if bool(x) else "❌")
-            st.dataframe(show_acc, use_container_width=True, hide_index=True)
+            st.dataframe(safe_streamlit_df(show_acc), use_container_width=True, hide_index=True)
 
             st.markdown("### Lectura rápida")
             st.write(
@@ -5376,7 +5469,7 @@ def streamlit_app():
         for col in ["accuracy", "f1_weighted", "log_loss", "brier_score"]:
             if col in metrics.columns:
                 metrics[col] = metrics[col].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
-        st.dataframe(metrics.sort_values(["log_loss", "brier_score", "f1_weighted"], ascending=[True, True, False]), use_container_width=True)
+        st.dataframe(safe_streamlit_df(metrics.sort_values(["log_loss", "brier_score", "f1_weighted"], ascending=[True, True, False])), use_container_width=True)
 
         st.markdown("""
         **Lectura rápida:**
@@ -5393,7 +5486,7 @@ def streamlit_app():
             for col in ["mae_home", "mae_away", "mae_promedio"]:
                 if col in gm.columns:
                     gm[col] = gm[col].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
-            st.dataframe(gm.sort_values("mae_promedio"), use_container_width=True)
+            st.dataframe(safe_streamlit_df(gm.sort_values("mae_promedio")), use_container_width=True)
             st.caption(f'Mejor modelo de goles: {training_result.get("goal_best_name")}')
 
         st.subheader("Backtesting Mundial 2018 / 2022")
@@ -5411,7 +5504,7 @@ def streamlit_app():
             for col in ["accuracy", "log_loss", "brier_score"]:
                 if col in bt.columns:
                     bt[col] = bt[col].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
-            st.dataframe(bt, use_container_width=True, hide_index=True)
+            st.dataframe(safe_streamlit_df(bt), use_container_width=True, hide_index=True)
             st.caption(
                 "Backtesting mejorado: ahora evalúa solo partidos exactos con tournament = World Cup "
                 "y escoge el mejor modelo con validación temporal antes de probar cada Mundial."
@@ -5432,13 +5525,13 @@ def streamlit_app():
         imp = get_feature_importance(training_result).head(25)
         imp_show = imp[["variable", "peso_%"]].copy()
         imp_show["peso_%"] = imp_show["peso_%"].map(lambda x: f"{x:.2f}%")
-        st.dataframe(imp_show, use_container_width=True, hide_index=True)
+        st.dataframe(safe_streamlit_df(imp_show), use_container_width=True, hide_index=True)
 
     with tab7:
         st.subheader("Variables usadas para este partido")
         ff = prediction["future_features"].T.reset_index()
         ff.columns = ["Variable", "Valor"]
-        st.dataframe(ff, use_container_width=True, hide_index=True)
+        st.dataframe(safe_streamlit_df(ff), use_container_width=True, hide_index=True)
 
     st.divider()
     st.caption(
