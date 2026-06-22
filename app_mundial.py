@@ -1101,6 +1101,66 @@ class TeamMemory:
             f"matches_count_last{n}": len(last),
         }
 
+    def streak_stats(self, team, n=10):
+        """
+        Señales de racha y tendencia reciente.
+        Sirven para mejorar forma corta y detección de empates/partidos cerrados.
+        """
+        self.ensure_team(team)
+        hist = self.matches[team]
+        if len(hist) == 0:
+            return {
+                f"win_streak_last{n}": 0,
+                f"unbeaten_streak_last{n}": 0,
+                f"no_score_streak_last{n}": 0,
+                f"clean_sheet_streak_last{n}": 0,
+                f"draw_rate_last{n}": 0.25,
+                f"low_score_rate_last{n}": 0.45,
+            }
+
+        last = hist[-n:]
+
+        win_streak = 0
+        unbeaten_streak = 0
+        no_score_streak = 0
+        clean_sheet_streak = 0
+
+        for m in reversed(last):
+            if m["points"] == 3:
+                win_streak += 1
+            else:
+                break
+
+        for m in reversed(last):
+            if m["points"] >= 1:
+                unbeaten_streak += 1
+            else:
+                break
+
+        for m in reversed(last):
+            if m["gf"] == 0:
+                no_score_streak += 1
+            else:
+                break
+
+        for m in reversed(last):
+            if m["ga"] == 0:
+                clean_sheet_streak += 1
+            else:
+                break
+
+        draws = [1 if m["points"] == 1 else 0 for m in last]
+        low_scores = [1 if (m["gf"] + m["ga"]) <= 2 else 0 for m in last]
+
+        return {
+            f"win_streak_last{n}": int(win_streak),
+            f"unbeaten_streak_last{n}": int(unbeaten_streak),
+            f"no_score_streak_last{n}": int(no_score_streak),
+            f"clean_sheet_streak_last{n}": int(clean_sheet_streak),
+            f"draw_rate_last{n}": float(np.mean(draws)) if draws else 0.25,
+            f"low_score_rate_last{n}": float(np.mean(low_scores)) if low_scores else 0.45,
+        }
+
     def days_rest(self, team, current_date):
         self.ensure_team(team)
         hist = self.matches[team]
@@ -1162,6 +1222,194 @@ def h2h_stats(history_df_until_date, team_a, team_b, n=5):
     }
 
 
+def tournament_category_features(tournament):
+    """One-hot suave por tipo de torneo para que el modelo distinga contexto competitivo."""
+    t = str(tournament or "").lower()
+    is_world_cup = int("world cup" in t)
+    is_qualifier = int("qualif" in t or "qualification" in t or "qualifying" in t)
+    is_continental = int(any(k in t for k in ["euro", "copa america", "african cup", "asian cup", "gold cup", "nations cup"]))
+    is_nations = int("nations league" in t)
+    is_friendly = int("friendly" in t or "amistoso" in t)
+    is_official = int(max(is_world_cup, is_qualifier, is_continental, is_nations) == 1 and is_friendly == 0)
+    return {
+        "is_world_cup": is_world_cup,
+        "is_qualifier": is_qualifier,
+        "is_continental": is_continental,
+        "is_nations_league": is_nations,
+        "is_friendly": is_friendly,
+        "is_official_match": is_official,
+    }
+
+
+def add_matchup_signal_features(feat):
+    """
+    Señales derivadas para mejorar precisión, especialmente empates y partidos cerrados.
+    Modifica feat in-place y lo devuelve.
+    """
+    elo_diff = float(feat.get("elo_diff", 0.0))
+    feat["elo_abs_diff"] = abs(elo_diff)
+    feat["elo_close_index"] = clamp(1.0 - abs(elo_diff) / 260.0, 0.0, 1.0)
+
+    for n in [3, 5, 10, 20]:
+        hg = float(feat.get(f"home_gf_last{n}", feat.get("home_gf_last10", 1.2)))
+        ag = float(feat.get(f"away_gf_last{n}", feat.get("away_gf_last10", 1.2)))
+        hga = float(feat.get(f"home_ga_last{n}", feat.get("home_ga_last10", 1.2)))
+        aga = float(feat.get(f"away_ga_last{n}", feat.get("away_ga_last10", 1.2)))
+        hd = float(feat.get(f"home_draw_rate_last{n}", 0.25))
+        ad = float(feat.get(f"away_draw_rate_last{n}", 0.25))
+        hlow = float(feat.get(f"home_low_score_rate_last{n}", 0.45))
+        alow = float(feat.get(f"away_low_score_rate_last{n}", 0.45))
+
+        feat[f"attack_balance_last{n}"] = abs(hg - ag)
+        feat[f"defense_balance_last{n}"] = abs(hga - aga)
+        feat[f"combined_defense_strength_last{n}"] = (2.2 - min(2.2, hga + aga)) / 2.2
+        feat[f"draw_tendency_last{n}"] = (hd + ad) / 2.0
+        feat[f"low_score_tendency_last{n}"] = (hlow + alow) / 2.0
+
+    feat["draw_signal"] = clamp(
+        0.35 * feat.get("elo_close_index", 0.0)
+        + 0.20 * feat.get("draw_tendency_last10", 0.25)
+        + 0.20 * feat.get("low_score_tendency_last10", 0.45)
+        + 0.15 * feat.get("combined_defense_strength_last10", 0.0)
+        + 0.10 * (1.0 - min(1.0, abs(float(feat.get("points_diff_last10", 0.0))) / 2.0)),
+        0.0,
+        1.0,
+    )
+    feat["favorite_strength"] = clamp(abs(elo_diff) / 340.0 + abs(float(feat.get("points_diff_last10", 0.0))) / 5.0, 0.0, 1.5)
+    return feat
+
+
+def compute_training_sample_weight(df):
+    """
+    Pesa partidos oficiales y recientes más que amistosos antiguos.
+    Esto ayuda a que el modelo aprenda mejor contextos competitivos.
+    """
+    if df is None or df.empty:
+        return None
+    out = df.copy()
+    base = pd.to_numeric(out.get("tournament_weight", 1.0), errors="coerce").fillna(1.0).astype(float)
+    years = pd.to_datetime(out["date"], errors="coerce").dt.year.fillna(pd.Timestamp.today().year)
+    if years.max() == years.min():
+        recency = pd.Series(1.0, index=out.index)
+    else:
+        recency = 0.70 + 0.45 * ((years - years.min()) / max(1, years.max() - years.min()))
+    weights = base * recency
+    return np.asarray(np.clip(weights, 0.45, 2.25), dtype=float)
+
+
+def fit_with_optional_sample_weight(model, X, y, sample_weight=None):
+    """Entrena con sample_weight cuando el estimador lo soporta; si no, cae a fit normal."""
+    if sample_weight is None:
+        model.fit(X, y)
+        return model
+    try:
+        model.fit(X, y, sample_weight=sample_weight)
+        return model
+    except Exception:
+        pass
+    try:
+        if isinstance(model, Pipeline):
+            last_step_name = model.steps[-1][0]
+            model.fit(X, y, **{f"{last_step_name}__sample_weight": sample_weight})
+            return model
+    except Exception:
+        pass
+    model.fit(X, y)
+    return model
+
+
+def build_ensemble_weights(metrics_df):
+    """
+    Convierte métricas de validación en pesos para ensamble.
+    Favorece menor log_loss y brier; evita que un modelo malo domine.
+    """
+    if metrics_df is None or metrics_df.empty:
+        return {}
+    rows = []
+    for _, r in metrics_df.iterrows():
+        name = r.get("modelo")
+        ll = r.get("log_loss", np.nan)
+        br = r.get("brier_score", np.nan)
+        f1 = r.get("f1_weighted", np.nan)
+        acc = r.get("accuracy", np.nan)
+        if pd.isna(ll) and pd.isna(br):
+            score = max(0.001, float(f1 if pd.notna(f1) else acc if pd.notna(acc) else 0.001))
+        else:
+            ll = float(ll) if pd.notna(ll) else 1.20
+            br = float(br) if pd.notna(br) else 0.70
+            score = 1.0 / max(0.10, (0.72 * ll + 0.28 * br))
+        rows.append((name, score))
+    total = sum(max(0.0, s) for _, s in rows)
+    if total <= 0:
+        return {}
+    weights = {str(n): float(s / total) for n, s in rows if n}
+    # Concentración moderada: no usar modelos con peso minúsculo.
+    weights = {k: v for k, v in weights.items() if v >= 0.04}
+    total = sum(weights.values())
+    return {k: v / total for k, v in weights.items()} if total > 0 else {}
+
+
+def ensemble_predict_proba(training_result, X):
+    """Predice probabilidades con ensamble ponderado; fallback al mejor modelo."""
+    models = training_result.get("models", {})
+    weights = training_result.get("ensemble_weights", {})
+    probs = []
+    used_weights = []
+    for name, w in weights.items():
+        model = models.get(name)
+        if model is None or not hasattr(model, "predict_proba"):
+            continue
+        try:
+            p = np.asarray(model.predict_proba(X)[0], dtype=float)
+            if len(p) == 3 and np.all(np.isfinite(p)):
+                probs.append(p)
+                used_weights.append(float(w))
+        except Exception:
+            continue
+    if probs:
+        W = np.asarray(used_weights, dtype=float)
+        W = W / W.sum()
+        out = np.average(np.vstack(probs), axis=0, weights=W)
+        out = np.clip(out, 1e-6, 1.0)
+        return out / out.sum(), {"mode": "ensemble", "weights_used": dict(zip([k for k in weights.keys()][:len(W)], W.tolist()))}
+
+    model = training_result["best_model"]
+    if hasattr(model, "predict_proba"):
+        p = np.asarray(model.predict_proba(X)[0], dtype=float)
+    else:
+        pred = model.predict(X)[0]
+        p = np.array([0.0, 0.0, 0.0])
+        p[pred] = 1.0
+    p = np.clip(p, 1e-6, 1.0)
+    return p / p.sum(), {"mode": "best_model", "weights_used": {training_result.get("best_name", "best"): 1.0}}
+
+
+def apply_draw_probability_adjustment(ml_probs, row, lam_a=None, lam_b=None):
+    """Ajuste moderado para empates en partidos cerrados."""
+    p = np.asarray(ml_probs, dtype=float).copy()
+    p = np.clip(p, 1e-6, 1.0)
+    p = p / p.sum()
+
+    draw_signal = float(row.iloc[0].get("draw_signal", 0.35)) if hasattr(row, "iloc") else 0.35
+    elo_close = float(row.iloc[0].get("elo_close_index", 0.0)) if hasattr(row, "iloc") else 0.0
+    stage_knockout = float(row.iloc[0].get("stage_knockout", 0.0)) if hasattr(row, "iloc") else 0.0
+    lambda_close = 0.0
+    if lam_a is not None and lam_b is not None:
+        lambda_close = clamp(1.0 - abs(float(lam_a) - float(lam_b)) / 1.25, 0.0, 1.0)
+
+    boost = 1.0 + 0.22 * draw_signal + 0.10 * elo_close + 0.12 * lambda_close + 0.08 * stage_knockout
+    p[1] *= clamp(boost, 1.0, 1.42)
+
+    # Evita que el empate se infle cuando hay favorito muy fuerte.
+    favorite_strength = float(row.iloc[0].get("favorite_strength", 0.0)) if hasattr(row, "iloc") else 0.0
+    if favorite_strength > 0.85:
+        p[1] *= 0.88
+
+    p = np.clip(p, 1e-6, 1.0)
+    return p / p.sum()
+
+
+
 def build_features_from_results(results_df, min_year=2000):
     """
     Construye dataset de entrenamiento.
@@ -1191,10 +1439,18 @@ def build_features_from_results(results_df, min_year=2000):
         home_elo = mem.get_elo(home)
         away_elo = mem.get_elo(away)
 
+        home3 = mem.rolling_stats(home, date, 3)
+        away3 = mem.rolling_stats(away, date, 3)
         home5 = mem.rolling_stats(home, date, 5)
         away5 = mem.rolling_stats(away, date, 5)
         home10 = mem.rolling_stats(home, date, 10)
         away10 = mem.rolling_stats(away, date, 10)
+        home20 = mem.rolling_stats(home, date, 20)
+        away20 = mem.rolling_stats(away, date, 20)
+        home_streak10 = mem.streak_stats(home, 10)
+        away_streak10 = mem.streak_stats(away, 10)
+        home_streak20 = mem.streak_stats(home, 20)
+        away_streak20 = mem.streak_stats(away, 20)
 
         past_df = pd.DataFrame(past_rows) if past_rows else pd.DataFrame()
         h2h = h2h_stats(past_df, home, away, 5)
@@ -1241,6 +1497,30 @@ def build_features_from_results(results_df, min_year=2000):
             "lineup_rating_home": 5.5,
             "lineup_rating_away": 5.5,
             "lineup_rating_diff": 0.0,
+            "gk_rating_home": 5.5,
+            "gk_rating_away": 5.5,
+            "gk_rating_diff": 0.0,
+            "def_rating_home": 5.5,
+            "def_rating_away": 5.5,
+            "def_rating_diff": 0.0,
+            "mid_rating_home": 5.5,
+            "mid_rating_away": 5.5,
+            "mid_rating_diff": 0.0,
+            "att_rating_home": 5.5,
+            "att_rating_away": 5.5,
+            "att_rating_diff": 0.0,
+            "bench_rating_home": 5.5,
+            "bench_rating_away": 5.5,
+            "bench_rating_diff": 0.0,
+            "key_absences_home": 0.0,
+            "key_absences_away": 0.0,
+            "key_absences_diff": 0.0,
+            "gk_absence_home": 0,
+            "gk_absence_away": 0,
+            "def_absence_home": 0,
+            "def_absence_away": 0,
+            "att_absence_home": 0,
+            "att_absence_away": 0,
 
             # Contexto competitivo. En el histórico se deja neutral.
             "stage_group": 1,
@@ -1264,7 +1544,13 @@ def build_features_from_results(results_df, min_year=2000):
             "h2h_matches": h2h["h2h_matches"],
         }
 
-        # Diferencias de forma últimos 5 y 10
+        feat.update(tournament_category_features(tournament))
+
+        # Forma reciente multi-ventana: últimos 3, 5, 10 y 20 partidos.
+        for key, val in home3.items():
+            feat["home_" + key] = val
+        for key, val in away3.items():
+            feat["away_" + key] = val
         for key, val in home5.items():
             feat["home_" + key] = val
         for key, val in away5.items():
@@ -1273,16 +1559,36 @@ def build_features_from_results(results_df, min_year=2000):
             feat["home_" + key] = val
         for key, val in away10.items():
             feat["away_" + key] = val
+        for key, val in home20.items():
+            feat["home_" + key] = val
+        for key, val in away20.items():
+            feat["away_" + key] = val
+        for key, val in home_streak10.items():
+            feat["home_" + key] = val
+        for key, val in away_streak10.items():
+            feat["away_" + key] = val
+        for key, val in home_streak20.items():
+            feat["home_" + key] = val
+        for key, val in away_streak20.items():
+            feat["away_" + key] = val
 
         # Variables comparativas más fuertes
-        for n in [5, 10]:
+        for n in [3, 5, 10, 20]:
             feat[f"gf_diff_last{n}"] = feat[f"home_gf_last{n}"] - feat[f"away_gf_last{n}"]
             feat[f"ga_diff_last{n}"] = feat[f"home_ga_last{n}"] - feat[f"away_ga_last{n}"]
             feat[f"points_diff_last{n}"] = feat[f"home_points_last{n}"] - feat[f"away_points_last{n}"]
             feat[f"win_rate_diff_last{n}"] = feat[f"home_win_rate_last{n}"] - feat[f"away_win_rate_last{n}"]
             feat[f"clean_sheet_diff_last{n}"] = feat[f"home_clean_sheet_last{n}"] - feat[f"away_clean_sheet_last{n}"]
             feat[f"scored_rate_diff_last{n}"] = feat[f"home_scored_rate_last{n}"] - feat[f"away_scored_rate_last{n}"]
+            if f"home_draw_rate_last{n}" in feat and f"away_draw_rate_last{n}" in feat:
+                feat[f"draw_rate_diff_last{n}"] = feat[f"home_draw_rate_last{n}"] - feat[f"away_draw_rate_last{n}"]
+                feat[f"low_score_rate_diff_last{n}"] = feat[f"home_low_score_rate_last{n}"] - feat[f"away_low_score_rate_last{n}"]
+                feat[f"win_streak_diff_last{n}"] = feat[f"home_win_streak_last{n}"] - feat[f"away_win_streak_last{n}"]
+                feat[f"unbeaten_streak_diff_last{n}"] = feat[f"home_unbeaten_streak_last{n}"] - feat[f"away_unbeaten_streak_last{n}"]
+                feat[f"no_score_streak_diff_last{n}"] = feat[f"home_no_score_streak_last{n}"] - feat[f"away_no_score_streak_last{n}"]
+                feat[f"clean_sheet_streak_diff_last{n}"] = feat[f"home_clean_sheet_streak_last{n}"] - feat[f"away_clean_sheet_streak_last{n}"]
 
+        feat = add_matchup_signal_features(feat)
         feature_rows.append(feat)
 
         # Actualizar memoria después del partido
@@ -1391,6 +1697,9 @@ def get_goal_regressors():
         "HistGradientBoosting goles": MultiOutputRegressor(
             HistGradientBoostingRegressor(random_state=RANDOM_STATE)
         ),
+        "PoissonRegressor goles": MultiOutputRegressor(
+            PoissonRegressor(alpha=0.04, max_iter=700)
+        ),
     }
 
     try:
@@ -1420,13 +1729,17 @@ def train_goal_regressors(train_df, test_df, feature_cols):
     X_test = test_df[feature_cols]
     y_train = train_df[["home_score", "away_score"]]
     y_test = test_df[["home_score", "away_score"]]
+    sample_weight = compute_training_sample_weight(train_df)
 
     fitted = {}
     rows = []
 
     for name, model in get_goal_regressors().items():
         try:
-            model.fit(X_train, y_train)
+            try:
+                model.fit(X_train, y_train, sample_weight=sample_weight)
+            except Exception:
+                model.fit(X_train, y_train)
             pred = np.asarray(model.predict(X_test), dtype=float)
             pred = np.clip(pred, 0, 6)
 
@@ -1493,6 +1806,7 @@ def train_and_compare(features_df, feature_cols):
     y_train = train_df["target"]
     X_test = test_df[feature_cols]
     y_test = test_df["target"]
+    sample_weight = compute_training_sample_weight(train_df)
 
     models = get_models()
 
@@ -1507,7 +1821,7 @@ def train_and_compare(features_df, feature_cols):
 
     for name, model in models.items():
         try:
-            model.fit(X_train, y_train)
+            fit_with_optional_sample_weight(model, X_train, y_train, sample_weight=sample_weight)
             pred = model.predict(X_test)
 
             if hasattr(model, "predict_proba"):
@@ -1555,6 +1869,7 @@ def train_and_compare(features_df, feature_cols):
     best_model = fitted[best_name]
 
     goal_best_name, goal_best_model, goal_metrics = train_goal_regressors(train_df, test_df, feature_cols)
+    ensemble_weights = build_ensemble_weights(metrics_df)
 
     result = {
         "features_df": df,
@@ -1570,6 +1885,7 @@ def train_and_compare(features_df, feature_cols):
         "goal_best_name": goal_best_name,
         "goal_best_model": goal_best_model,
         "goal_metrics": goal_metrics,
+        "ensemble_weights": ensemble_weights,
     }
 
     return result
@@ -1697,49 +2013,97 @@ def load_player_ratings():
 
 def calculate_team_lineup_rating(team, ratings_df=None):
     """
-    Calcula rating promedio de alineación.
+    Calcula rating de alineación con desglose por posición.
     Prioridad:
     1. jugadores available=True y expected_starter=True;
-    2. si hay menos de 8, usa los mejores 11 disponibles;
-    3. si no hay datos, devuelve 5.5.
+    2. si hay menos de 8, usa mejores 11 disponibles;
+    3. si no hay datos, devuelve valores neutrales.
+
+    Además detecta ausencias clave por posición para que no pese igual perder un arquero
+    titular que perder un suplente.
     """
+    neutral = {
+        "rating": 5.5, "players_used": 0, "status": "Sin datos de jugadores",
+        "gk_rating": 5.5, "def_rating": 5.5, "mid_rating": 5.5, "att_rating": 5.5, "bench_rating": 5.5,
+        "key_absences": 0.0, "gk_absence": 0, "def_absence": 0, "att_absence": 0,
+    }
     if ratings_df is None:
         ratings_df = load_player_ratings()
 
     if ratings_df is None or ratings_df.empty:
-        return {"rating": 5.5, "players_used": 0, "status": "Sin datos de jugadores"}
+        return neutral
 
-    d = ratings_df[(ratings_df["team"] == team) & (ratings_df["available"] == True)].copy()
+    all_team = ratings_df[ratings_df["team"] == team].copy()
+    if all_team.empty:
+        return neutral
 
+    all_team["player_score"] = 0.65 * all_team["career_rating"] + 0.35 * all_team["current_form_rating"]
+
+    d = all_team[all_team["available"] == True].copy()
     if d.empty:
-        return {"rating": 5.5, "players_used": 0, "status": "Sin datos disponibles"}
-
-    # Score jugador: carrera pesa más, forma reciente también importa.
-    d["player_score"] = 0.65 * d["career_rating"] + 0.35 * d["current_form_rating"]
+        out = neutral.copy(); out["status"] = "Sin jugadores disponibles"
+        return out
 
     pos_weight = {
-        "GK": 1.00, "GKP": 1.00, "PORTERO": 1.00,
-        "DEF": 1.00, "DF": 1.00,
-        "MID": 1.05, "MF": 1.05,
-        "FWD": 1.10, "FW": 1.10, "ST": 1.10,
+        "GK": 1.18, "GKP": 1.18, "PORTERO": 1.18,
+        "DEF": 1.08, "DF": 1.08, "CB": 1.10, "LB": 1.04, "RB": 1.04,
+        "MID": 1.06, "MF": 1.06, "CM": 1.08, "DM": 1.08, "AM": 1.08,
+        "FWD": 1.14, "FW": 1.14, "ST": 1.18, "LW": 1.10, "RW": 1.10,
     }
     d["pos_weight"] = d["position"].map(pos_weight).fillna(1.00)
     d["weighted_score"] = d["player_score"] * d["pos_weight"]
 
     starters = d[d["expected_starter"] == True].copy()
-
     if len(starters) >= 8:
-        selected = starters.sort_values(["lineup_type", "last_seen_date"], ascending=[True, False]).head(11)
+        selected = starters.sort_values(["lineup_type", "last_seen_date", "weighted_score"], ascending=[True, False, False]).head(11)
         status = "Usando alineación marcada como titular/probable"
     else:
         selected = d.sort_values("weighted_score", ascending=False).head(11)
         status = "Usando mejores 11 disponibles por rating"
 
     if selected.empty:
-        return {"rating": 5.5, "players_used": 0, "status": "Sin datos suficientes"}
+        return neutral
+
+    def pos_avg(patterns, default=5.5):
+        mask = selected["position"].astype(str).str.upper().apply(lambda x: any(p in x for p in patterns))
+        subset = selected[mask]
+        if subset.empty:
+            return default
+        return float(np.average(subset["player_score"], weights=subset["pos_weight"]))
+
+    gk_rating = pos_avg(["GK", "GKP", "PORTERO"], 5.5)
+    def_rating = pos_avg(["DEF", "DF", "CB", "LB", "RB"], 5.5)
+    mid_rating = pos_avg(["MID", "MF", "CM", "DM", "AM"], 5.5)
+    att_rating = pos_avg(["FWD", "FW", "ST", "LW", "RW"], 5.5)
+
+    bench = d.drop(selected.index, errors="ignore").sort_values("weighted_score", ascending=False).head(7)
+    bench_rating = float(bench["player_score"].mean()) if not bench.empty else 5.5
+
+    unavailable_key = all_team[(all_team["available"] == False) & (all_team["expected_starter"] == True)].copy()
+    unavailable_key = unavailable_key[unavailable_key["player_score"] >= 6.8]
+    key_absences = float(len(unavailable_key))
+    gk_abs = int(unavailable_key["position"].astype(str).str.upper().str.contains("GK|GKP|PORTERO", regex=True).any()) if not unavailable_key.empty else 0
+    def_abs = int(unavailable_key["position"].astype(str).str.upper().str.contains("DEF|DF|CB|LB|RB", regex=True).any()) if not unavailable_key.empty else 0
+    att_abs = int(unavailable_key["position"].astype(str).str.upper().str.contains("FWD|FW|ST|LW|RW", regex=True).any()) if not unavailable_key.empty else 0
 
     rating = float(np.average(selected["player_score"], weights=selected["pos_weight"]))
-    return {"rating": rating, "players_used": int(len(selected)), "status": status}
+    # Penalización suave por ausencias clave.
+    rating = clamp(rating - min(1.35, 0.18 * key_absences + 0.35 * gk_abs + 0.18 * def_abs + 0.20 * att_abs), 0, 10)
+
+    return {
+        "rating": rating,
+        "players_used": int(len(selected)),
+        "status": status,
+        "gk_rating": gk_rating,
+        "def_rating": def_rating,
+        "mid_rating": mid_rating,
+        "att_rating": att_rating,
+        "bench_rating": bench_rating,
+        "key_absences": key_absences,
+        "gk_absence": gk_abs,
+        "def_absence": def_abs,
+        "att_absence": att_abs,
+    }
 
 
 def climate_score_for_team(team, temperature_c=22, humidity_pct=55, altitude_m=300):
@@ -2100,6 +2464,24 @@ def auto_fetch_advanced_context(api_key, team_a, team_b, sede_pais, venue_key, m
         "controversy_b": news_score_b["controversy"],
         "lineup_rating_a": float(lineup_a["rating"]),
         "lineup_rating_b": float(lineup_b["rating"]),
+        "gk_rating_a": float(lineup_a.get("gk_rating", lineup_a["rating"])),
+        "gk_rating_b": float(lineup_b.get("gk_rating", lineup_b["rating"])),
+        "def_rating_a": float(lineup_a.get("def_rating", lineup_a["rating"])),
+        "def_rating_b": float(lineup_b.get("def_rating", lineup_b["rating"])),
+        "mid_rating_a": float(lineup_a.get("mid_rating", lineup_a["rating"])),
+        "mid_rating_b": float(lineup_b.get("mid_rating", lineup_b["rating"])),
+        "att_rating_a": float(lineup_a.get("att_rating", lineup_a["rating"])),
+        "att_rating_b": float(lineup_b.get("att_rating", lineup_b["rating"])),
+        "bench_rating_a": float(lineup_a.get("bench_rating", 5.5)),
+        "bench_rating_b": float(lineup_b.get("bench_rating", 5.5)),
+        "key_absences_a": float(lineup_a.get("key_absences", 0.0)),
+        "key_absences_b": float(lineup_b.get("key_absences", 0.0)),
+        "gk_absence_a": float(lineup_a.get("gk_absence", 0.0)),
+        "gk_absence_b": float(lineup_b.get("gk_absence", 0.0)),
+        "def_absence_a": float(lineup_a.get("def_absence", 0.0)),
+        "def_absence_b": float(lineup_b.get("def_absence", 0.0)),
+        "att_absence_a": float(lineup_a.get("att_absence", 0.0)),
+        "att_absence_b": float(lineup_b.get("att_absence", 0.0)),
     }
 
     sources = {
@@ -2158,6 +2540,24 @@ def build_advanced_context_features(team_a, team_b, advanced_context=None):
 
     lineup_rating_a = float(advanced_context.get("lineup_rating_a", 5.5))
     lineup_rating_b = float(advanced_context.get("lineup_rating_b", 5.5))
+    gk_rating_a = float(advanced_context.get("gk_rating_a", lineup_rating_a))
+    gk_rating_b = float(advanced_context.get("gk_rating_b", lineup_rating_b))
+    def_rating_a = float(advanced_context.get("def_rating_a", lineup_rating_a))
+    def_rating_b = float(advanced_context.get("def_rating_b", lineup_rating_b))
+    mid_rating_a = float(advanced_context.get("mid_rating_a", lineup_rating_a))
+    mid_rating_b = float(advanced_context.get("mid_rating_b", lineup_rating_b))
+    att_rating_a = float(advanced_context.get("att_rating_a", lineup_rating_a))
+    att_rating_b = float(advanced_context.get("att_rating_b", lineup_rating_b))
+    bench_rating_a = float(advanced_context.get("bench_rating_a", 5.5))
+    bench_rating_b = float(advanced_context.get("bench_rating_b", 5.5))
+    key_absences_a = float(advanced_context.get("key_absences_a", 0.0))
+    key_absences_b = float(advanced_context.get("key_absences_b", 0.0))
+    gk_absence_a = float(advanced_context.get("gk_absence_a", 0.0))
+    gk_absence_b = float(advanced_context.get("gk_absence_b", 0.0))
+    def_absence_a = float(advanced_context.get("def_absence_a", 0.0))
+    def_absence_b = float(advanced_context.get("def_absence_b", 0.0))
+    att_absence_a = float(advanced_context.get("att_absence_a", 0.0))
+    att_absence_b = float(advanced_context.get("att_absence_b", 0.0))
 
     stage = str(advanced_context.get("stage", "Fase de grupos"))
     is_knockout = 1 if stage != "Fase de grupos" else 0
@@ -2182,6 +2582,30 @@ def build_advanced_context_features(team_a, team_b, advanced_context=None):
         "lineup_rating_home": clamp(lineup_rating_a, 0, 10),
         "lineup_rating_away": clamp(lineup_rating_b, 0, 10),
         "lineup_rating_diff": (clamp(lineup_rating_a, 0, 10) - clamp(lineup_rating_b, 0, 10)) / 10.0,
+        "gk_rating_home": clamp(gk_rating_a, 0, 10),
+        "gk_rating_away": clamp(gk_rating_b, 0, 10),
+        "gk_rating_diff": (clamp(gk_rating_a, 0, 10) - clamp(gk_rating_b, 0, 10)) / 10.0,
+        "def_rating_home": clamp(def_rating_a, 0, 10),
+        "def_rating_away": clamp(def_rating_b, 0, 10),
+        "def_rating_diff": (clamp(def_rating_a, 0, 10) - clamp(def_rating_b, 0, 10)) / 10.0,
+        "mid_rating_home": clamp(mid_rating_a, 0, 10),
+        "mid_rating_away": clamp(mid_rating_b, 0, 10),
+        "mid_rating_diff": (clamp(mid_rating_a, 0, 10) - clamp(mid_rating_b, 0, 10)) / 10.0,
+        "att_rating_home": clamp(att_rating_a, 0, 10),
+        "att_rating_away": clamp(att_rating_b, 0, 10),
+        "att_rating_diff": (clamp(att_rating_a, 0, 10) - clamp(att_rating_b, 0, 10)) / 10.0,
+        "bench_rating_home": clamp(bench_rating_a, 0, 10),
+        "bench_rating_away": clamp(bench_rating_b, 0, 10),
+        "bench_rating_diff": (clamp(bench_rating_a, 0, 10) - clamp(bench_rating_b, 0, 10)) / 10.0,
+        "key_absences_home": clamp(key_absences_a, 0, 8),
+        "key_absences_away": clamp(key_absences_b, 0, 8),
+        "key_absences_diff": (clamp(key_absences_b, 0, 8) - clamp(key_absences_a, 0, 8)) / 8.0,
+        "gk_absence_home": int(gk_absence_a > 0),
+        "gk_absence_away": int(gk_absence_b > 0),
+        "def_absence_home": int(def_absence_a > 0),
+        "def_absence_away": int(def_absence_b > 0),
+        "att_absence_home": int(att_absence_a > 0),
+        "att_absence_away": int(att_absence_b > 0),
 
         "stage_group": is_group,
         "stage_knockout": is_knockout,
@@ -2211,10 +2635,18 @@ def build_future_match_features(mem, history_df, team_a, team_b, neutral=True, t
     home_elo = mem.get_elo(team_a)
     away_elo = mem.get_elo(team_b)
 
+    home3 = mem.rolling_stats(team_a, None, 3)
+    away3 = mem.rolling_stats(team_b, None, 3)
     home5 = mem.rolling_stats(team_a, None, 5)
     away5 = mem.rolling_stats(team_b, None, 5)
     home10 = mem.rolling_stats(team_a, None, 10)
     away10 = mem.rolling_stats(team_b, None, 10)
+    home20 = mem.rolling_stats(team_a, None, 20)
+    away20 = mem.rolling_stats(team_b, None, 20)
+    home_streak10 = mem.streak_stats(team_a, 10)
+    away_streak10 = mem.streak_stats(team_b, 10)
+    home_streak20 = mem.streak_stats(team_a, 20)
+    away_streak20 = mem.streak_stats(team_b, 20)
 
     h2h = h2h_stats(history_df, team_a, team_b, 5)
     venue = compute_worldcup_host_advantage(team_a, team_b, sede_pais=sede_pais)
@@ -2254,6 +2686,30 @@ def build_future_match_features(mem, history_df, team_a, team_b, neutral=True, t
         "lineup_rating_home": advanced_features["lineup_rating_home"],
         "lineup_rating_away": advanced_features["lineup_rating_away"],
         "lineup_rating_diff": advanced_features["lineup_rating_diff"],
+        "gk_rating_home": advanced_features["gk_rating_home"],
+        "gk_rating_away": advanced_features["gk_rating_away"],
+        "gk_rating_diff": advanced_features["gk_rating_diff"],
+        "def_rating_home": advanced_features["def_rating_home"],
+        "def_rating_away": advanced_features["def_rating_away"],
+        "def_rating_diff": advanced_features["def_rating_diff"],
+        "mid_rating_home": advanced_features["mid_rating_home"],
+        "mid_rating_away": advanced_features["mid_rating_away"],
+        "mid_rating_diff": advanced_features["mid_rating_diff"],
+        "att_rating_home": advanced_features["att_rating_home"],
+        "att_rating_away": advanced_features["att_rating_away"],
+        "att_rating_diff": advanced_features["att_rating_diff"],
+        "bench_rating_home": advanced_features["bench_rating_home"],
+        "bench_rating_away": advanced_features["bench_rating_away"],
+        "bench_rating_diff": advanced_features["bench_rating_diff"],
+        "key_absences_home": advanced_features["key_absences_home"],
+        "key_absences_away": advanced_features["key_absences_away"],
+        "key_absences_diff": advanced_features["key_absences_diff"],
+        "gk_absence_home": advanced_features["gk_absence_home"],
+        "gk_absence_away": advanced_features["gk_absence_away"],
+        "def_absence_home": advanced_features["def_absence_home"],
+        "def_absence_away": advanced_features["def_absence_away"],
+        "att_absence_home": advanced_features["att_absence_home"],
+        "att_absence_away": advanced_features["att_absence_away"],
 
         "stage_group": advanced_features["stage_group"],
         "stage_knockout": advanced_features["stage_knockout"],
@@ -2262,6 +2718,12 @@ def build_future_match_features(mem, history_df, team_a, team_b, neutral=True, t
         "urgency_diff": advanced_features["urgency_diff"],
     }
 
+    feat.update(tournament_category_features(tournament))
+
+    for key, val in home3.items():
+        feat["home_" + key] = val
+    for key, val in away3.items():
+        feat["away_" + key] = val
     for key, val in home5.items():
         feat["home_" + key] = val
     for key, val in away5.items():
@@ -2270,15 +2732,35 @@ def build_future_match_features(mem, history_df, team_a, team_b, neutral=True, t
         feat["home_" + key] = val
     for key, val in away10.items():
         feat["away_" + key] = val
+    for key, val in home20.items():
+        feat["home_" + key] = val
+    for key, val in away20.items():
+        feat["away_" + key] = val
+    for key, val in home_streak10.items():
+        feat["home_" + key] = val
+    for key, val in away_streak10.items():
+        feat["away_" + key] = val
+    for key, val in home_streak20.items():
+        feat["home_" + key] = val
+    for key, val in away_streak20.items():
+        feat["away_" + key] = val
 
-    for n in [5, 10]:
+    for n in [3, 5, 10, 20]:
         feat[f"gf_diff_last{n}"] = feat[f"home_gf_last{n}"] - feat[f"away_gf_last{n}"]
         feat[f"ga_diff_last{n}"] = feat[f"home_ga_last{n}"] - feat[f"away_ga_last{n}"]
         feat[f"points_diff_last{n}"] = feat[f"home_points_last{n}"] - feat[f"away_points_last{n}"]
         feat[f"win_rate_diff_last{n}"] = feat[f"home_win_rate_last{n}"] - feat[f"away_win_rate_last{n}"]
         feat[f"clean_sheet_diff_last{n}"] = feat[f"home_clean_sheet_last{n}"] - feat[f"away_clean_sheet_last{n}"]
         feat[f"scored_rate_diff_last{n}"] = feat[f"home_scored_rate_last{n}"] - feat[f"away_scored_rate_last{n}"]
+        if f"home_draw_rate_last{n}" in feat and f"away_draw_rate_last{n}" in feat:
+            feat[f"draw_rate_diff_last{n}"] = feat[f"home_draw_rate_last{n}"] - feat[f"away_draw_rate_last{n}"]
+            feat[f"low_score_rate_diff_last{n}"] = feat[f"home_low_score_rate_last{n}"] - feat[f"away_low_score_rate_last{n}"]
+            feat[f"win_streak_diff_last{n}"] = feat[f"home_win_streak_last{n}"] - feat[f"away_win_streak_last{n}"]
+            feat[f"unbeaten_streak_diff_last{n}"] = feat[f"home_unbeaten_streak_last{n}"] - feat[f"away_unbeaten_streak_last{n}"]
+            feat[f"no_score_streak_diff_last{n}"] = feat[f"home_no_score_streak_last{n}"] - feat[f"away_no_score_streak_last{n}"]
+            feat[f"clean_sheet_streak_diff_last{n}"] = feat[f"home_clean_sheet_streak_last{n}"] - feat[f"away_clean_sheet_streak_last{n}"]
 
+    feat = add_matchup_signal_features(feat)
     return pd.DataFrame([feat])
 
 
@@ -2344,8 +2826,16 @@ def poisson_score_matrix(future_row, lambda_override=None, use_dixon_coles=True)
     social_factor_a = 1 + 0.035 * ((float(r.get("social_score_home", 5.0)) - 5.0) / 5.0)
     social_factor_b = 1 + 0.035 * ((float(r.get("social_score_away", 5.0)) - 5.0) / 5.0)
 
-    lineup_factor_a = 1 + 0.070 * ((float(r.get("lineup_rating_home", 5.5)) - 5.5) / 4.5)
-    lineup_factor_b = 1 + 0.070 * ((float(r.get("lineup_rating_away", 5.5)) - 5.5) / 4.5)
+    lineup_factor_a = 1 + 0.055 * ((float(r.get("lineup_rating_home", 5.5)) - 5.5) / 4.5)
+    lineup_factor_b = 1 + 0.055 * ((float(r.get("lineup_rating_away", 5.5)) - 5.5) / 4.5)
+
+    # Ratings por línea: ataque propio y debilidad defensiva rival afectan goles.
+    attack_line_factor_a = 1 + 0.052 * ((float(r.get("att_rating_home", r.get("lineup_rating_home", 5.5))) - 5.5) / 4.5) + 0.024 * ((float(r.get("mid_rating_home", 5.5)) - 5.5) / 4.5)
+    attack_line_factor_b = 1 + 0.052 * ((float(r.get("att_rating_away", r.get("lineup_rating_away", 5.5))) - 5.5) / 4.5) + 0.024 * ((float(r.get("mid_rating_away", 5.5)) - 5.5) / 4.5)
+    defensive_resistance_a = 1 - 0.035 * ((float(r.get("def_rating_home", 5.5)) - 5.5) / 4.5) - 0.030 * ((float(r.get("gk_rating_home", 5.5)) - 5.5) / 4.5)
+    defensive_resistance_b = 1 - 0.035 * ((float(r.get("def_rating_away", 5.5)) - 5.5) / 4.5) - 0.030 * ((float(r.get("gk_rating_away", 5.5)) - 5.5) / 4.5)
+    absence_factor_a = 1 - min(0.16, 0.022 * float(r.get("key_absences_home", 0)) + 0.040 * float(r.get("gk_absence_home", 0)) + 0.025 * float(r.get("att_absence_home", 0)))
+    absence_factor_b = 1 - min(0.16, 0.022 * float(r.get("key_absences_away", 0)) + 0.040 * float(r.get("gk_absence_away", 0)) + 0.025 * float(r.get("att_absence_away", 0)))
 
     # En eliminatorias suele haber más cautela; en fase de grupos la urgencia puede abrir el partido.
     knockout_factor = 0.94 if float(r.get("stage_knockout", 0)) == 1 else 1.00
@@ -2353,16 +2843,16 @@ def poisson_score_matrix(future_row, lambda_override=None, use_dixon_coles=True)
     urgency_factor_b = 1 + 0.055 * ((float(r.get("urgency_away", 5.0)) - 5.0) / 5.0)
 
     advanced_factor_a = clamp(
-        climate_factor_a * mental_factor_a * social_factor_a * lineup_factor_a * urgency_factor_a * knockout_factor,
-        0.74, 1.34
+        climate_factor_a * mental_factor_a * social_factor_a * lineup_factor_a * urgency_factor_a * knockout_factor * attack_line_factor_a * absence_factor_a,
+        0.68, 1.42
     )
     advanced_factor_b = clamp(
-        climate_factor_b * mental_factor_b * social_factor_b * lineup_factor_b * urgency_factor_b * knockout_factor,
-        0.74, 1.34
+        climate_factor_b * mental_factor_b * social_factor_b * lineup_factor_b * urgency_factor_b * knockout_factor * attack_line_factor_b * absence_factor_b,
+        0.68, 1.42
     )
 
-    lam_a = base_goals * attack_a * defense_b * elo_factor_a * rest_factor_a * host_factor_a * advanced_factor_a
-    lam_b = base_goals * attack_b * defense_a * elo_factor_b * rest_factor_b * host_factor_b * advanced_factor_b
+    lam_a = base_goals * attack_a * defense_b * defensive_resistance_b * elo_factor_a * rest_factor_a * host_factor_a * advanced_factor_a
+    lam_b = base_goals * attack_b * defense_a * defensive_resistance_a * elo_factor_b * rest_factor_b * host_factor_b * advanced_factor_b
 
     if lambda_override is not None:
         try:
@@ -2446,17 +2936,10 @@ def predict_match(training_result, mem, history_df, team_a, team_b, neutral=True
     la matriz final de marcadores, combinando ML + Poisson + sede.
     """
     feature_cols = training_result["feature_cols"]
-    model = training_result["best_model"]
-
     row = build_future_match_features(mem, history_df, team_a, team_b, neutral=neutral, sede_pais=sede_pais, advanced_context=advanced_context)
     X = row.reindex(columns=feature_cols).fillna(0)
 
-    if hasattr(model, "predict_proba"):
-        ml_probs = model.predict_proba(X)[0]
-    else:
-        pred = model.predict(X)[0]
-        ml_probs = np.array([0.0, 0.0, 0.0])
-        ml_probs[pred] = 1.0
+    ml_probs, ensemble_info = ensemble_predict_proba(training_result, X)
 
     lambda_override = None
     goal_model = training_result.get("goal_best_model")
@@ -2469,8 +2952,11 @@ def predict_match(training_result, mem, history_df, team_a, team_b, neutral=True
 
     score_df, lam_a, lam_b = poisson_score_matrix(row, lambda_override=lambda_override, use_dixon_coles=True)
 
-    # Combina ML con Poisson. La sede/anfitrión ya afectó los lambdas de Poisson.
-    score_df = blend_poisson_with_ml(score_df, ml_probs, alpha=0.55)
+    # Mejora de empates: ajuste moderado si Elo/lambdas/forma indican partido cerrado.
+    ml_probs = apply_draw_probability_adjustment(ml_probs, row, lam_a=lam_a, lam_b=lam_b)
+
+    # Combina ML ensemble con Poisson. La sede/anfitrión ya afectó los lambdas de Poisson.
+    score_df = blend_poisson_with_ml(score_df, ml_probs, alpha=0.58)
 
     # Las probabilidades mostradas arriba salen de la matriz final de marcadores,
     # no solo del ML. Así la sede cambia victoria/empate/derrota y no solo marcador exacto.
@@ -2504,7 +2990,8 @@ def predict_match(training_result, mem, history_df, team_a, team_b, neutral=True
         "lambda_a": lam_a,
         "lambda_b": lam_b,
         "lambda_override": lambda_override,
-        "future_features": row
+        "future_features": row,
+        "ensemble_info": ensemble_info,
     }
 
 
@@ -3224,10 +3711,30 @@ def backtest_world_cups(features_df=None, feature_cols=None, min_year_backtest=2
                 ll = np.nan
                 brier = np.nan
 
+            acc_general = accuracy_score(y_test, pred)
+            proba_df = pd.DataFrame(proba, columns=["p_home", "p_draw", "p_away"], index=test.index) if 'proba' in locals() and proba is not None else pd.DataFrame(index=test.index)
+            favorite_mask = proba_df.max(axis=1) >= 0.45 if not proba_df.empty else pd.Series(False, index=test.index)
+            close_mask = test["elo_abs_diff"] <= 110 if "elo_abs_diff" in test.columns else pd.Series(False, index=test.index)
+            group_mask = test["stage_group"] == 1 if "stage_group" in test.columns else pd.Series(False, index=test.index)
+            draw_mask = y_test == 1
+
+            def safe_acc(mask):
+                try:
+                    mask = pd.Series(mask, index=test.index).fillna(False)
+                    if mask.sum() == 0:
+                        return np.nan
+                    return accuracy_score(y_test[mask], pd.Series(pred, index=test.index)[mask])
+                except Exception:
+                    return np.nan
+
             rows.append({
                 "torneo": f"Mundial {year}",
                 "partidos_test": len(test),
-                "accuracy": accuracy_score(y_test, pred),
+                "accuracy": acc_general,
+                "accuracy_favoritos": safe_acc(favorite_mask),
+                "accuracy_empates": safe_acc(draw_mask),
+                "accuracy_cerrados": safe_acc(close_mask),
+                "accuracy_grupos": safe_acc(group_mask),
                 "log_loss": ll,
                 "brier_score": brier,
                 "mejor_modelo_bt": best_name,
@@ -4550,6 +5057,24 @@ def streamlit_app():
                 "controversy_b": 0,
                 "lineup_rating_a": float(lineup_a["rating"]),
                 "lineup_rating_b": float(lineup_b["rating"]),
+                "gk_rating_a": float(lineup_a.get("gk_rating", lineup_a["rating"])),
+                "gk_rating_b": float(lineup_b.get("gk_rating", lineup_b["rating"])),
+                "def_rating_a": float(lineup_a.get("def_rating", lineup_a["rating"])),
+                "def_rating_b": float(lineup_b.get("def_rating", lineup_b["rating"])),
+                "mid_rating_a": float(lineup_a.get("mid_rating", lineup_a["rating"])),
+                "mid_rating_b": float(lineup_b.get("mid_rating", lineup_b["rating"])),
+                "att_rating_a": float(lineup_a.get("att_rating", lineup_a["rating"])),
+                "att_rating_b": float(lineup_b.get("att_rating", lineup_b["rating"])),
+                "bench_rating_a": float(lineup_a.get("bench_rating", 5.5)),
+                "bench_rating_b": float(lineup_b.get("bench_rating", 5.5)),
+                "key_absences_a": float(lineup_a.get("key_absences", 0.0)),
+                "key_absences_b": float(lineup_b.get("key_absences", 0.0)),
+                "gk_absence_a": float(lineup_a.get("gk_absence", 0.0)),
+                "gk_absence_b": float(lineup_b.get("gk_absence", 0.0)),
+                "def_absence_a": float(lineup_a.get("def_absence", 0.0)),
+                "def_absence_b": float(lineup_b.get("def_absence", 0.0)),
+                "att_absence_a": float(lineup_a.get("att_absence", 0.0)),
+                "att_absence_b": float(lineup_b.get("att_absence", 0.0)),
             }
             auto_sources = {
                 "weather": {"message": "Automático desactivado"},
