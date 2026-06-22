@@ -1175,21 +1175,47 @@ def model_proba_safe(model, X):
 
 def compute_prediction_stability(training_result, X, max_models=6):
     """
-    Mide cuánto varían las probabilidades entre modelos disponibles.
-    Menor variación = predicción más estable.
+    Mide estabilidad combinando:
+    - variación entre modelos,
+    - margen entre la mejor y segunda probabilidad,
+    - modo oficial estable.
+
+    En fútbol es normal que modelos distintos discrepen. Por eso la etiqueta no debe
+    castigar demasiado una variación moderada.
     """
     models = training_result.get("models", {}) if isinstance(training_result, dict) else {}
     probas = []
     names = []
-    for name, model in list(models.items())[:max_models]:
-        if hasattr(model, "predict_proba"):
-            try:
-                p = model_proba_safe(model, X)
-                if len(p) == 3 and np.all(np.isfinite(p)):
-                    probas.append(p)
-                    names.append(name)
-            except Exception:
-                pass
+
+    preferred = [
+        training_result.get("official_model_name", OFFICIAL_MODEL_NAME),
+        "Logistic Regression",
+        "Random Forest",
+        "XGBoost",
+        "Gradient Boosting",
+        "HistGradientBoosting",
+        "Red neuronal simple",
+    ]
+
+    ordered = []
+    for name in preferred:
+        if name in models and name not in ordered:
+            ordered.append(name)
+    for name in models.keys():
+        if name not in ordered:
+            ordered.append(name)
+
+    for name in ordered[:max_models]:
+        model = models.get(name)
+        if model is None or not hasattr(model, "predict_proba"):
+            continue
+        try:
+            p = model_proba_safe(model, X)
+            if len(p) == 3 and np.all(np.isfinite(p)):
+                probas.append(p)
+                names.append(name)
+        except Exception:
+            pass
 
     if len(probas) < 2:
         return {
@@ -1203,18 +1229,33 @@ def compute_prediction_stability(training_result, X, max_models=6):
     std_mean = float(np.mean(np.std(arr, axis=0)))
     variation_pct = round(std_mean * 100, 2)
 
-    if variation_pct <= 3:
+    official_p = model_proba_safe(
+        training_result.get("official_model") or training_result.get("best_model"),
+        X
+    )
+    sorted_p = np.sort(official_p)[::-1]
+    margin_pct = float((sorted_p[0] - sorted_p[1]) * 100) if len(sorted_p) >= 2 else 0.0
+
+    # Umbrales ajustados: variación 8-10% todavía puede ser estabilidad media.
+    if variation_pct <= 5.0:
         label = "Alta"
-    elif variation_pct <= 7:
+    elif variation_pct <= 11.0:
         label = "Media"
     else:
+        label = "Baja"
+
+    # Si el partido es muy cerrado, bajamos un nivel aunque los modelos no varíen mucho.
+    if margin_pct < 7.0 and label == "Alta":
+        label = "Media"
+    elif margin_pct < 4.0 and label == "Media":
         label = "Baja"
 
     return {
         "label": label,
         "variation_pct": variation_pct,
+        "margin_pct": round(margin_pct, 2),
         "models_used": len(probas),
-        "note": f"Variación promedio entre modelos: {variation_pct}%"
+        "note": f"Variación promedio: {variation_pct}%. Margen líder vs segundo: {margin_pct:.2f}%."
     }
 
 
@@ -1672,8 +1713,38 @@ def ensemble_predict_proba(training_result, X):
     }
 
 
+def redistribute_draw_excess(p, max_draw):
+    """Si el empate supera el máximo razonable, redistribuye exceso hacia victoria/derrota."""
+    p = np.asarray(p, dtype=float).copy()
+    p = np.clip(p, 1e-6, 1.0)
+    p = p / p.sum()
+
+    if p[1] <= max_draw:
+        return p
+
+    excess = p[1] - max_draw
+    p[1] = max_draw
+    non_draw_sum = p[0] + p[2]
+    if non_draw_sum <= 0:
+        p[0] += excess / 2
+        p[2] += excess / 2
+    else:
+        p[0] += excess * (p[0] / non_draw_sum)
+        p[2] += excess * (p[2] / non_draw_sum)
+
+    p = np.clip(p, 1e-6, 1.0)
+    return p / p.sum()
+
+
 def apply_draw_probability_adjustment(ml_probs, row, lam_a=None, lam_b=None):
-    """Ajuste moderado para empates en partidos cerrados."""
+    """
+    Ajuste de empate más conservador.
+    Antes el empate se inflaba demasiado y hacía que el marcador 1-1 apareciera como top
+    en demasiados partidos. Ahora:
+    - solo sube el empate si el partido realmente luce cerrado,
+    - limita empate si hay favorito claro,
+    - usa lambdas y Elo para evitar empates artificiales.
+    """
     p = np.asarray(ml_probs, dtype=float).copy()
     p = np.clip(p, 1e-6, 1.0)
     p = p / p.sum()
@@ -1681,21 +1752,48 @@ def apply_draw_probability_adjustment(ml_probs, row, lam_a=None, lam_b=None):
     draw_signal = float(row.iloc[0].get("draw_signal", 0.35)) if hasattr(row, "iloc") else 0.35
     elo_close = float(row.iloc[0].get("elo_close_index", 0.0)) if hasattr(row, "iloc") else 0.0
     stage_knockout = float(row.iloc[0].get("stage_knockout", 0.0)) if hasattr(row, "iloc") else 0.0
-    lambda_close = 0.0
-    if lam_a is not None and lam_b is not None:
-        lambda_close = clamp(1.0 - abs(float(lam_a) - float(lam_b)) / 1.25, 0.0, 1.0)
-
-    boost = 1.0 + 0.22 * draw_signal + 0.10 * elo_close + 0.12 * lambda_close + 0.08 * stage_knockout
-    p[1] *= clamp(boost, 1.0, 1.42)
-
-    # Evita que el empate se infle cuando hay favorito muy fuerte.
     favorite_strength = float(row.iloc[0].get("favorite_strength", 0.0)) if hasattr(row, "iloc") else 0.0
-    if favorite_strength > 0.85:
-        p[1] *= 0.88
+
+    lambda_close = 0.0
+    lambda_diff = 0.0
+    total_lambda = 2.55
+    if lam_a is not None and lam_b is not None:
+        lambda_diff = abs(float(lam_a) - float(lam_b))
+        total_lambda = float(lam_a) + float(lam_b)
+        lambda_close = clamp(1.0 - lambda_diff / 1.15, 0.0, 1.0)
+
+    close_match_index = clamp(
+        0.38 * draw_signal + 0.26 * elo_close + 0.26 * lambda_close + 0.10 * stage_knockout,
+        0.0, 1.0
+    )
+
+    # Boost pequeño: el empate no debe dominar si no hay evidencia fuerte.
+    boost = 1.0 + 0.14 * close_match_index
+    p[1] *= clamp(boost, 1.0, 1.18)
+
+    # Si hay favorito fuerte o mucha diferencia de goles esperados, baja el empate.
+    if favorite_strength > 0.72:
+        p[1] *= 0.90
+    if favorite_strength > 0.90:
+        p[1] *= 0.82
+    if lambda_diff > 0.65:
+        p[1] *= 0.90
+    if total_lambda > 3.25 and stage_knockout == 0:
+        # Partidos abiertos tienden a romper más el empate.
+        p[1] *= 0.92
 
     p = np.clip(p, 1e-6, 1.0)
-    return p / p.sum()
+    p = p / p.sum()
 
+    # Cap dinámico de empate. Si de verdad es cerrado, permite más.
+    max_draw = 0.30 + 0.08 * close_match_index
+    if favorite_strength > 0.75:
+        max_draw -= 0.03
+    if lambda_diff > 0.75:
+        max_draw -= 0.03
+    max_draw = clamp(max_draw, 0.24, 0.39)
+
+    return redistribute_draw_excess(p, max_draw)
 
 
 def build_features_from_results(results_df, min_year=2000):
@@ -3177,7 +3275,21 @@ def poisson_score_matrix(future_row, lambda_override=None, use_dixon_coles=True)
             p = poisson.pmf(ga, lam_a) * poisson.pmf(gb, lam_b)
 
             if use_dixon_coles:
-                p *= dixon_coles_tau(ga, gb, lam_a, lam_b, rho=-0.06)
+                p *= dixon_coles_tau(ga, gb, lam_a, lam_b, rho=-0.025)
+
+            # Calibración de empates/marcadores iguales.
+            # Evita que 1-1 sea el marcador top por defecto cuando hay favorito claro.
+            draw_signal = float(r.get("draw_signal", 0.35))
+            favorite_strength = float(r.get("favorite_strength", 0.0))
+            lambda_diff = abs(float(lam_a) - float(lam_b))
+            lambda_close = clamp(1.0 - lambda_diff / 1.15, 0.0, 1.0)
+            draw_context = clamp(0.45 * draw_signal + 0.35 * lambda_close + 0.20 * float(r.get("elo_close_index", 0.0)), 0.0, 1.0)
+
+            if ga == gb:
+                diag_factor = clamp(0.88 + 0.20 * draw_context - 0.14 * favorite_strength, 0.78, 1.08)
+                if ga == 1 and gb == 1:
+                    diag_factor *= clamp(0.92 + 0.15 * draw_context - 0.10 * favorite_strength, 0.78, 1.05)
+                p *= diag_factor
 
             if ga > gb:
                 outcome = 0
@@ -3200,7 +3312,7 @@ def poisson_score_matrix(future_row, lambda_override=None, use_dixon_coles=True)
     return score_df, lam_a, lam_b
 
 
-def blend_poisson_with_ml(score_df, ml_probs, alpha=0.55):
+def blend_poisson_with_ml(score_df, ml_probs, alpha=0.48):
     """
     Ajusta probabilidades de marcadores para que respeten la probabilidad W/D/L del ML.
     alpha = peso del ML.
@@ -3260,7 +3372,7 @@ def predict_match(training_result, mem, history_df, team_a, team_b, neutral=True
     ml_probs = apply_draw_probability_adjustment(ml_probs, row, lam_a=lam_a, lam_b=lam_b)
 
     # Combina ML ensemble con Poisson. La sede/anfitrión ya afectó los lambdas de Poisson.
-    score_df = blend_poisson_with_ml(score_df, ml_probs, alpha=0.58)
+    score_df = blend_poisson_with_ml(score_df, ml_probs, alpha=0.50)
 
     # Las probabilidades mostradas arriba salen de la matriz final de marcadores,
     # no solo del ML. Así la sede cambia victoria/empate/derrota y no solo marcador exacto.
@@ -4867,18 +4979,20 @@ def streamlit_secrets_file_exists():
 
 def get_config_value(key, default=""):
     """
-    Lee configuración sin generar errores visuales si no existe secrets.toml.
+    Lee configuración segura.
     Prioridad:
     1. Variables de entorno.
-    2. st.secrets solo si existe archivo .streamlit/secrets.toml.
+    2. st.secrets de Streamlit Cloud o secrets.toml local.
     3. Valor por defecto.
+
+    Esto permite fijar API_FOOTBALL_KEY en Streamlit Secrets sin mostrarla en la UI.
     """
     env_value = os.getenv(key)
     if env_value is not None:
         return env_value
 
     try:
-        if STREAMLIT_OK and streamlit_secrets_file_exists():
+        if STREAMLIT_OK:
             return st.secrets.get(key, default)
     except Exception:
         pass
@@ -5033,6 +5147,220 @@ def render_public_landing(settings):
         )
 
 
+
+# ============================================================
+# 10C. IDIOMAS Y CONFIGURACIÓN PRIVADA
+# ============================================================
+
+LANG_OPTIONS = {
+    "Español": "es",
+    "English": "en",
+    "Português": "pt",
+    "Français": "fr",
+}
+
+TRANSLATIONS = {
+    "es": {
+        "main_title": "Predictor Mundial 2026 con Poisson + Machine Learning",
+        "author": "Autor",
+        "objective": "Objetivo",
+        "objective_text": "estimar probabilidades, goles esperados y marcadores probables con datos recientes.",
+        "caption": "Modelo educativo: estima probabilidades y marcadores probables. No usa cuotas ni servicios de apuestas.",
+        "language": "Idioma",
+        "settings": "Configuración",
+        "api_fixed": "API-Football configurada desde Secrets. La clave no se muestra públicamente.",
+        "api_optional": "Clave API_FOOTBALL opcional",
+        "api_help": "Si no tienes clave API, el modelo usa histórico + datos manuales.",
+        "force_update": "Forzar actualización web",
+        "min_year": "Usar partidos desde el año",
+        "manual_info": "Puedes editar datos/mundial_2026_manual.csv para añadir resultados recientes si no quieres usar API.",
+        "execution_panel": "Panel de ejecución",
+        "execution_text": "El análisis no se ejecuta automáticamente. Presiona el botón cuando quieras cargar datos, entrenar modelos y generar resultados.",
+        "retrain": "🚀 Reentrenar modelo estable",
+        "load_saved": "📦 Cargar guardado",
+        "press_train": "Presiona **🚀 Reentrenar modelo estable** para cargar la información.",
+        "loaded_saved": "✅ Modelo estable guardado cargado correctamente.",
+        "saved_not_loaded": "No se pudo cargar el modelo guardado. Reentrena el modelo.",
+        "official_model": "Modelo oficial",
+        "best_validation": "Mejor validación",
+        "stability": "Estabilidad",
+        "version": "Versión",
+        "analyze_match": "Analizar partido específico",
+        "team_a": "Equipo A",
+        "team_b": "Equipo B",
+        "host_country": "País sede del partido",
+        "data_quality": "Calidad de datos",
+        "victory": "Victoria",
+        "draw": "Empate",
+        "expected_goals": "Goles esperados",
+        "prediction_stability": "Estabilidad predicción",
+        "top_scores": "Marcadores más probables",
+        "performance_compare": "Comparación de rendimiento",
+        "tabs_champion": "Campeón Mundial",
+        "tabs_map": "Mapa del Mundial",
+        "tabs_precision": "Precisión",
+        "tabs_models": "Modelos",
+        "tabs_confusion": "Matriz de confusión",
+        "tabs_corr": "Matriz de correlación",
+        "tabs_importance": "Peso de variables",
+        "tabs_match_data": "Datos del partido",
+    },
+    "en": {
+        "main_title": "World Cup 2026 Predictor with Poisson + Machine Learning",
+        "author": "Author",
+        "objective": "Objective",
+        "objective_text": "estimate probabilities, expected goals and likely scores using recent data.",
+        "caption": "Educational model: estimates probabilities and likely scores. It does not use betting odds or gambling services.",
+        "language": "Language",
+        "settings": "Settings",
+        "api_fixed": "API-Football is configured from Secrets. The key is not publicly displayed.",
+        "api_optional": "Optional API_FOOTBALL key",
+        "api_help": "Without an API key, the model uses historical + manual data.",
+        "force_update": "Force web update",
+        "min_year": "Use matches since year",
+        "manual_info": "You can edit datos/mundial_2026_manual.csv to add recent results without using the API.",
+        "execution_panel": "Execution panel",
+        "execution_text": "The analysis does not run automatically. Press the button to load data, train models and generate results.",
+        "retrain": "🚀 Retrain stable model",
+        "load_saved": "📦 Load saved",
+        "press_train": "Press **🚀 Retrain stable model** to load the information.",
+        "loaded_saved": "✅ Saved stable model loaded correctly.",
+        "saved_not_loaded": "Could not load the saved model. Retrain the model.",
+        "official_model": "Official model",
+        "best_validation": "Best validation",
+        "stability": "Stability",
+        "version": "Version",
+        "analyze_match": "Analyze specific match",
+        "team_a": "Team A",
+        "team_b": "Team B",
+        "host_country": "Host country",
+        "data_quality": "Data quality",
+        "victory": "Win",
+        "draw": "Draw",
+        "expected_goals": "Expected goals",
+        "prediction_stability": "Prediction stability",
+        "top_scores": "Most likely scores",
+        "performance_compare": "Performance comparison",
+        "tabs_champion": "World Cup Champion",
+        "tabs_map": "World Cup Map",
+        "tabs_precision": "Accuracy",
+        "tabs_models": "Models",
+        "tabs_confusion": "Confusion matrix",
+        "tabs_corr": "Correlation matrix",
+        "tabs_importance": "Feature importance",
+        "tabs_match_data": "Match data",
+    },
+    "pt": {
+        "main_title": "Preditor Copa do Mundo 2026 com Poisson + Machine Learning",
+        "author": "Autor",
+        "objective": "Objetivo",
+        "objective_text": "estimar probabilidades, gols esperados e placares prováveis com dados recentes.",
+        "caption": "Modelo educacional: estima probabilidades e placares prováveis. Não usa odds nem serviços de apostas.",
+        "language": "Idioma",
+        "settings": "Configuração",
+        "api_fixed": "API-Football configurada via Secrets. A chave não é exibida publicamente.",
+        "api_optional": "Chave API_FOOTBALL opcional",
+        "api_help": "Sem chave API, o modelo usa histórico + dados manuais.",
+        "force_update": "Forçar atualização web",
+        "min_year": "Usar partidas desde o ano",
+        "manual_info": "Você pode editar datos/mundial_2026_manual.csv para adicionar resultados recentes sem usar API.",
+        "execution_panel": "Painel de execução",
+        "execution_text": "A análise não roda automaticamente. Pressione o botão para carregar dados, treinar modelos e gerar resultados.",
+        "retrain": "🚀 Retreinar modelo estável",
+        "load_saved": "📦 Carregar salvo",
+        "press_train": "Pressione **🚀 Retreinar modelo estável** para carregar as informações.",
+        "loaded_saved": "✅ Modelo estável salvo carregado corretamente.",
+        "saved_not_loaded": "Não foi possível carregar o modelo salvo. Retreine o modelo.",
+        "official_model": "Modelo oficial",
+        "best_validation": "Melhor validação",
+        "stability": "Estabilidade",
+        "version": "Versão",
+        "analyze_match": "Analisar partida específica",
+        "team_a": "Equipe A",
+        "team_b": "Equipe B",
+        "host_country": "País-sede da partida",
+        "data_quality": "Qualidade dos dados",
+        "victory": "Vitória",
+        "draw": "Empate",
+        "expected_goals": "Gols esperados",
+        "prediction_stability": "Estabilidade da previsão",
+        "top_scores": "Placares mais prováveis",
+        "performance_compare": "Comparação de desempenho",
+        "tabs_champion": "Campeão Mundial",
+        "tabs_map": "Mapa do Mundial",
+        "tabs_precision": "Precisão",
+        "tabs_models": "Modelos",
+        "tabs_confusion": "Matriz de confusão",
+        "tabs_corr": "Matriz de correlação",
+        "tabs_importance": "Peso das variáveis",
+        "tabs_match_data": "Dados da partida",
+    },
+    "fr": {
+        "main_title": "Prédicteur Coupe du Monde 2026 avec Poisson + Machine Learning",
+        "author": "Auteur",
+        "objective": "Objectif",
+        "objective_text": "estimer les probabilités, les buts attendus et les scores probables avec des données récentes.",
+        "caption": "Modèle éducatif : estime des probabilités et scores probables. N'utilise pas de cotes ni services de paris.",
+        "language": "Langue",
+        "settings": "Configuration",
+        "api_fixed": "API-Football configurée via Secrets. La clé n'est pas affichée publiquement.",
+        "api_optional": "Clé API_FOOTBALL optionnelle",
+        "api_help": "Sans clé API, le modèle utilise l'historique + les données manuelles.",
+        "force_update": "Forcer la mise à jour web",
+        "min_year": "Utiliser les matchs depuis l'année",
+        "manual_info": "Vous pouvez modifier datos/mundial_2026_manual.csv pour ajouter des résultats récents sans API.",
+        "execution_panel": "Panneau d'exécution",
+        "execution_text": "L'analyse ne s'exécute pas automatiquement. Appuyez sur le bouton pour charger les données, entraîner les modèles et générer les résultats.",
+        "retrain": "🚀 Réentraîner le modèle stable",
+        "load_saved": "📦 Charger sauvegardé",
+        "press_train": "Appuyez sur **🚀 Réentraîner le modèle stable** pour charger les informations.",
+        "loaded_saved": "✅ Modèle stable sauvegardé chargé correctement.",
+        "saved_not_loaded": "Impossible de charger le modèle sauvegardé. Réentraînez le modèle.",
+        "official_model": "Modèle officiel",
+        "best_validation": "Meilleure validation",
+        "stability": "Stabilité",
+        "version": "Version",
+        "analyze_match": "Analyser un match précis",
+        "team_a": "Équipe A",
+        "team_b": "Équipe B",
+        "host_country": "Pays hôte du match",
+        "data_quality": "Qualité des données",
+        "victory": "Victoire",
+        "draw": "Nul",
+        "expected_goals": "Buts attendus",
+        "prediction_stability": "Stabilité de la prédiction",
+        "top_scores": "Scores les plus probables",
+        "performance_compare": "Comparaison de performance",
+        "tabs_champion": "Champion du Monde",
+        "tabs_map": "Carte du Mondial",
+        "tabs_precision": "Précision",
+        "tabs_models": "Modèles",
+        "tabs_confusion": "Matrice de confusion",
+        "tabs_corr": "Matrice de corrélation",
+        "tabs_importance": "Importance des variables",
+        "tabs_match_data": "Données du match",
+    }
+}
+
+
+def tr(key, lang="es"):
+    lang = lang if lang in TRANSLATIONS else "es"
+    return TRANSLATIONS.get(lang, TRANSLATIONS["es"]).get(key, TRANSLATIONS["es"].get(key, key))
+
+
+def get_fixed_api_key():
+    """
+    Lee la API key desde Secrets/variables de entorno. No la muestra al público.
+    Configura en Streamlit Secrets:
+    API_FOOTBALL_KEY = "tu_clave"
+    """
+    for key in ["API_FOOTBALL_KEY", "FOOTBALL_API_KEY", "API_SPORTS_KEY"]:
+        val = str(get_config_value(key, "") or "").strip()
+        if val:
+            return val
+    return ""
+
+
 def enforce_access_gate():
     """
     Bloquea la app si APP_REQUIRE_ACCESS=true y no hay código válido.
@@ -5056,6 +5384,19 @@ def streamlit_app():
         page_icon="⚽",
         layout="wide"
     )
+
+    # Idioma global de la interfaz.
+    default_lang_name = str(get_config_value("APP_DEFAULT_LANGUAGE", "Español"))
+    if default_lang_name not in LANG_OPTIONS:
+        default_lang_name = "Español"
+    with st.sidebar:
+        selected_language_name = st.selectbox(
+            "🌐 Idioma / Language",
+            list(LANG_OPTIONS.keys()),
+            index=list(LANG_OPTIONS.keys()).index(default_lang_name),
+            key="app_language_name"
+        )
+    lang = LANG_OPTIONS.get(selected_language_name, "es")
 
     # Estilo visual simple para que la interfaz se vea más limpia.
     st.markdown("""
@@ -5083,17 +5424,14 @@ def streamlit_app():
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown('<div class="main-title">⚽ Predictor Mundial 2026 con Poisson + Machine Learning</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="main-title">⚽ {tr("main_title", lang)}</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="author-box"><b>Autor:</b> Eder R Perez Herrera<br>'
-        '<b>Objetivo:</b> estimar probabilidades, goles esperados y marcadores probables con datos recientes.</div>',
+        f'<div class="author-box"><b>{tr("author", lang)}:</b> Eder R Perez Herrera<br>'
+        f'<b>{tr("objective", lang)}:</b> {tr("objective_text", lang)}</div>',
         unsafe_allow_html=True
     )
 
-    st.caption(
-        "Modelo educativo: estima probabilidades y marcadores probables. "
-        "No usa cuotas ni servicios de apuestas."
-    )
+    st.caption(tr("caption", lang))
 
     access_settings = enforce_access_gate()
 
@@ -5101,45 +5439,44 @@ def streamlit_app():
     default_min_year = max(1980, current_year - 8)
 
     with st.sidebar:
-        st.header("Configuración")
+        st.header(tr("settings", lang))
 
-        api_key = st.text_input(
-            "Clave API_FOOTBALL opcional",
-            value=os.getenv("API_FOOTBALL_KEY", ""),
-            type="password",
-            help="Si no tienes clave API, el modelo usa histórico + datos manuales."
-        )
+        fixed_api_key = get_fixed_api_key()
+        if fixed_api_key:
+            api_key = fixed_api_key
+            st.success("🔐 " + tr("api_fixed", lang))
+        else:
+            api_key = st.text_input(
+                tr("api_optional", lang),
+                value="",
+                type="password",
+                help=tr("api_help", lang)
+            )
 
-        force_update = st.checkbox("Forzar actualización web", value=False)
+        force_update = st.checkbox(tr("force_update", lang), value=False)
 
         min_year = st.slider(
-            "Usar partidos desde el año",
+            tr("min_year", lang),
             min_value=1980,
             max_value=max(2026, current_year),
             value=default_min_year,
             help="Por defecto usa los últimos 8 años para que cargue más rápido y sea más relevante."
         )
 
-        st.info(
-            "Puedes editar datos/mundial_2026_manual.csv para añadir resultados recientes "
-            "si no quieres usar API."
-        )
+        st.info(tr("manual_info", lang))
 
         st.markdown("---")
-        st.markdown("**Autor:** Eder R Perez Herrera")
+        st.markdown(f"**{tr('author', lang)}:** Eder R Perez Herrera")
 
-    st.markdown("### Panel de ejecución")
-    st.write(
-        "El análisis no se ejecuta automáticamente. Presiona el botón cuando quieras cargar datos, "
-        "entrenar modelos y generar resultados."
-    )
+    st.markdown("### " + tr("execution_panel", lang))
+    st.write(tr("execution_text", lang))
 
     c_run, c_load = st.columns([3, 1])
     with c_run:
-        ejecutar = st.button("🚀 Reentrenar modelo estable", type="primary", use_container_width=True)
+        ejecutar = st.button(tr("retrain", lang), type="primary", use_container_width=True)
     with c_load:
         cargar_guardado = st.button(
-            "📦 Cargar guardado",
+            tr("load_saved", lang),
             use_container_width=True,
             disabled=not MODEL_ARTIFACT_PATH.exists(),
             help="Carga modelos/modelo_oficial.pkl si existe."
@@ -5160,9 +5497,9 @@ def streamlit_app():
             st.session_state.mem = artifact.get("mem")
             st.session_state.api_status = "Modelo estable cargado desde archivo guardado."
             st.session_state.min_year = artifact.get("metadata", {}).get("min_year", min_year)
-            st.success("✅ Modelo estable guardado cargado correctamente.")
+            st.success(tr("loaded_saved", lang))
         else:
-            st.warning("No se pudo cargar el modelo guardado. Reentrena el modelo.")
+            st.warning(tr("saved_not_loaded", lang))
 
     if ejecutar:
         progress_bar = st.progress(0, text="0% · Preparando análisis...")
@@ -5272,11 +5609,11 @@ def streamlit_app():
     colA, colB, colC, colD, colE, colF = st.columns(6)
     colA.metric("Partidos cargados", f"{len(results):,}")
     colB.metric("Filas entrenamiento", f"{len(training_result['features_df']):,}")
-    colC.metric("Modelo oficial", training_result.get("official_model_name", training_result.get("best_name", "")))
-    colD.metric("Mejor en validación", training_result.get("best_name", ""))
+    colC.metric(tr("official_model", lang), training_result.get("official_model_name", training_result.get("best_name", "")))
+    colD.metric(tr("best_validation", lang), training_result.get("best_name", ""))
     stability_summary = training_result.get("stability_summary", {})
-    colE.metric("Estabilidad", stability_summary.get("label", "Media"), f"{stability_summary.get('variation_pct', 0)}% var.")
-    colF.metric("Versión", training_result.get("model_version", MODEL_VERSION))
+    colE.metric(tr("stability", lang), stability_summary.get("label", "Media"), f"{stability_summary.get('variation_pct', 0)}% var.")
+    colF.metric(tr("version", lang), training_result.get("model_version", MODEL_VERSION))
     st.caption(
         "Modo producción estable: las predicciones públicas usan el modelo oficial fijo. "
         "La comparación de modelos queda como auditoría interna."
@@ -5286,13 +5623,13 @@ def streamlit_app():
 
     teams = sorted(set(results["home_team"]).union(set(results["away_team"])))
 
-    st.subheader("Analizar partido específico")
+    st.subheader(tr("analyze_match", lang))
 
     c1, c2, c3 = st.columns([2, 2, 2])
     with c1:
-        team_a = st.selectbox("Equipo A", teams, index=teams.index("Colombia") if "Colombia" in teams else 0)
+        team_a = st.selectbox(tr("team_a", lang), teams, index=teams.index("Colombia") if "Colombia" in teams else 0)
     with c2:
-        team_b = st.selectbox("Equipo B", teams, index=teams.index("Portugal") if "Portugal" in teams else min(1, len(teams)-1))
+        team_b = st.selectbox(tr("team_b", lang), teams, index=teams.index("Portugal") if "Portugal" in teams else min(1, len(teams)-1))
     with c3:
         sede_pais = st.selectbox(
             "País sede del partido",
@@ -5506,13 +5843,13 @@ def streamlit_app():
     )
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric(f"Victoria {team_a}", f"{probs['victoria_A']*100:.1f}%")
-    m2.metric("Empate", f"{probs['empate']*100:.1f}%")
-    m3.metric(f"Victoria {team_b}", f"{probs['victoria_B']*100:.1f}%")
-    m4.metric(f"Goles esperados {team_a}", f"{prediction['lambda_a']:.2f}")
-    m5.metric(f"Goles esperados {team_b}", f"{prediction['lambda_b']:.2f}")
+    m1.metric(f"{tr('victory', lang)} {team_a}", f"{probs['victoria_A']*100:.1f}%")
+    m2.metric(tr("draw", lang), f"{probs['empate']*100:.1f}%")
+    m3.metric(f"{tr('victory', lang)} {team_b}", f"{probs['victoria_B']*100:.1f}%")
+    m4.metric(f"{tr('expected_goals', lang)} {team_a}", f"{prediction['lambda_a']:.2f}")
+    m5.metric(f"{tr('expected_goals', lang)} {team_b}", f"{prediction['lambda_b']:.2f}")
     stability = prediction.get("ensemble_info", {}).get("stability", {})
-    m6.metric("Estabilidad predicción", stability.get("label", "Media"), f"{stability.get('variation_pct', 0)}% var.")
+    m6.metric(tr("prediction_stability", lang), stability.get("label", "Media"), f"{stability.get('variation_pct', 0)}% var.")
 
     st.caption(
         "Las probabilidades de victoria/empate/derrota se calculan con la matriz final de marcadores "
@@ -5523,27 +5860,27 @@ def streamlit_app():
     left, right = st.columns([1, 1])
 
     with left:
-        st.subheader("Marcadores más probables")
+        st.subheader(tr("top_scores", lang))
         top = prediction["top_scores"][["marcador", "probabilidad_%"]].copy()
         top["probabilidad_%"] = top["probabilidad_%"].map(lambda x: f"{x:.2f}%")
         st.dataframe(safe_streamlit_df(top), use_container_width=True, hide_index=True)
 
     with right:
-        st.subheader("Comparación de rendimiento")
+        st.subheader(tr("performance_compare", lang))
         fig = plot_team_comparison(prediction)
         st.pyplot(fig, clear_figure=True)
 
     st.divider()
 
     tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "Campeón Mundial",
-        "Mapa del Mundial",
-        "Precisión",
-        "Modelos",
-        "Matriz de confusión",
-        "Matriz de correlación",
-        "Peso de variables",
-        "Datos del partido"
+        tr("tabs_champion", lang),
+        tr("tabs_map", lang),
+        tr("tabs_precision", lang),
+        tr("tabs_models", lang),
+        tr("tabs_confusion", lang),
+        tr("tabs_corr", lang),
+        tr("tabs_importance", lang),
+        tr("tabs_match_data", lang)
     ])
 
     with tab0:
