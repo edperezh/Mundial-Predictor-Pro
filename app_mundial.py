@@ -115,7 +115,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V23_ESTABLE_PRODUCCION"
+MODEL_VERSION = "V27_CONTEO_AUTOMATICO"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -221,7 +221,27 @@ TEAM_ALIASES = {
     "Turkey": "Turkey",
     "Cape Verde Islands": "Cape Verde",
     "Cape Verde": "Cape Verde",
+    "Cabo Verde": "Cape Verde",
+    "Korea": "South Korea",
+    "Korea Rep": "South Korea",
+    "IR Iran": "Iran",
+    "Iran": "Iran",
+    "U.S.": "United States",
+    "United States": "United States",
+    "USA": "United States",
+    "Congo DR": "DR Congo",
+    "Congo": "DR Congo",
+    "D.R. Congo": "DR Congo",
+    "Bosnia-Herzegovina": "Bosnia and Herzegovina",
+    "Czech Republic": "Czechia",
+    "Czech": "Czechia",
+    "Türkiye": "Turkey",
+    "Turkiye": "Turkey",
+    "Côte d’Ivoire": "Ivory Coast",
+    "Côte d'Ivoire": "Ivory Coast",
+    "Curaçao": "Curacao",
 }
+
 
 def normalize_team_name(name):
     """Normaliza nombres entre API, CSV histórico y app."""
@@ -720,14 +740,22 @@ def fetch_espn_worldcup_scoreboard(match_date=None, force=False):
             date_key = pd.to_datetime(match_date).strftime("%Y%m%d")
 
         cache_path = CACHE_DIR / f"espn_worldcup_{date_key}.json"
-        if cache_path.exists() and not force:
+
+        # Para fechas recientes no usamos caché, porque los marcadores pueden cambiar durante el día.
+        try:
+            query_date = pd.to_datetime(match_date if match_date is not None else datetime.today()).date()
+            today = datetime.today().date()
+            recent_date = query_date >= (today - timedelta(days=1))
+        except Exception:
+            recent_date = True
+
+        if cache_path.exists() and not force and not recent_date:
             with open(cache_path, "r", encoding="utf-8") as f:
                 return json.load(f)
 
         urls = [
-            f"https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates={date_key}",
-            f"https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world.cup/scoreboard?dates={date_key}",
-            f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={date_key}",
+            f"https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates={date_key}&limit=200",
+            f"https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world.cup/scoreboard?dates={date_key}&limit=200",
         ]
 
         last_error = ""
@@ -831,6 +859,202 @@ def espn_scoreboard_to_results(data):
     if not rows:
         return pd.DataFrame()
     return clean_results_df(pd.DataFrame(rows))
+
+
+
+def espn_scoreboard_to_events(data):
+    """
+    Convierte scoreboard público de ESPN en eventos completos/en vivo/programados.
+    Esto permite contar automáticamente:
+    - partidos finalizados,
+    - partidos en vivo,
+    - partidos iniciados.
+    """
+    rows = []
+    if not data or not isinstance(data, dict):
+        return pd.DataFrame()
+
+    for ev in data.get("events", []):
+        try:
+            comp = (ev.get("competitions") or [{}])[0]
+            status_type = comp.get("status", {}).get("type", {}) or {}
+            status_name = str(status_type.get("name") or status_type.get("description") or "").strip()
+            state = str(status_type.get("state") or "").strip().lower()
+            completed = bool(status_type.get("completed", False))
+            in_progress = state in ["in", "live", "inprogress"] or status_name.upper() in ["STATUS_IN_PROGRESS", "IN_PROGRESS", "LIVE"]
+
+            competitors = comp.get("competitors", [])
+            if len(competitors) < 2:
+                continue
+
+            home = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
+            away = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
+
+            home_team = normalize_team_name(home.get("team", {}).get("displayName") or home.get("team", {}).get("name"))
+            away_team = normalize_team_name(away.get("team", {}).get("displayName") or away.get("team", {}).get("name"))
+
+            if home_team not in WC_2026_TEAMS or away_team not in WC_2026_TEAMS:
+                continue
+
+            hs = pd.to_numeric(home.get("score", None), errors="coerce")
+            aw = pd.to_numeric(away.get("score", None), errors="coerce")
+
+            rows.append({
+                "fixture_id": pd.to_numeric(ev.get("id", None), errors="coerce"),
+                "date": str(ev.get("date", ""))[:10],
+                "home_team": home_team,
+                "away_team": away_team,
+                "home_score": None if pd.isna(hs) else int(hs),
+                "away_score": None if pd.isna(aw) else int(aw),
+                "status": "Complete" if completed else "Live" if in_progress else "Scheduled",
+                "completed": completed,
+                "in_progress": in_progress,
+                "tournament": "FIFA World Cup",
+                "city": "",
+                "country": "",
+                "neutral": True,
+                "source": "ESPN público",
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "home_team", "away_team"])
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def fetch_free_worldcup_events_range(start_date="2026-06-11", end_date=None, force=False):
+    """
+    Trae eventos del Mundial 2026 desde fuentes públicas gratuitas.
+    No requiere API-Football ni Secrets.
+    """
+    if end_date is None:
+        end_date = datetime.today().date()
+
+    start_dt = pd.to_datetime(start_date, errors="coerce")
+    end_dt = pd.to_datetime(end_date, errors="coerce")
+
+    if pd.isna(start_dt) or pd.isna(end_dt):
+        return pd.DataFrame(), "Rango de fechas inválido."
+
+    frames = []
+    messages = []
+
+    d = start_dt
+    while d <= end_dt:
+        data = fetch_espn_worldcup_scoreboard(match_date=d.date(), force=force)
+        ev = espn_scoreboard_to_events(data)
+        if not ev.empty:
+            frames.append(ev)
+            comp = int(ev["completed"].sum())
+            live = int(ev["in_progress"].sum())
+            messages.append(f"{d.date()}: {len(ev)} eventos ({comp} finalizados, {live} en vivo)")
+        d += pd.Timedelta(days=1)
+
+    if not frames:
+        return pd.DataFrame(), "No se encontraron eventos públicos."
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.drop_duplicates(subset=["date", "home_team", "away_team"], keep="last")
+    return df.sort_values("date").reset_index(drop=True), "; ".join(messages)
+
+
+def automatic_worldcup_public_count(force=False):
+    """
+    Conteo automático desde fuente pública.
+    Devuelve conteo de finalizados y en vivo para evitar modificar Secrets manualmente.
+    """
+    try:
+        events, msg = fetch_free_worldcup_events_range(
+            start_date="2026-06-11",
+            end_date=datetime.today().date(),
+            force=force
+        )
+        if events is None or events.empty:
+            return {
+                "ok": False,
+                "source": "sin fuente pública",
+                "completed_count": 0,
+                "live_count": 0,
+                "started_count": 0,
+                "events": pd.DataFrame(),
+                "completed_df": pd.DataFrame(),
+                "message": msg,
+            }
+
+        completed = events[events["completed"] == True].copy()
+        live = events[events["in_progress"] == True].copy()
+
+        # Solo los finalizados alimentan el modelo.
+        completed_df = completed.dropna(subset=["home_score", "away_score"]).copy()
+        if not completed_df.empty:
+            completed_df = clean_results_df(completed_df[[
+                "date", "home_team", "away_team", "home_score", "away_score",
+                "tournament", "city", "country", "neutral"
+            ]])
+
+        return {
+            "ok": True,
+            "source": "ESPN público automático",
+            "completed_count": int(len(completed_df)),
+            "live_count": int(len(live)),
+            "started_count": int(len(completed_df) + len(live)),
+            "events": events,
+            "completed_df": completed_df,
+            "message": msg,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "source": "error fuente pública",
+            "completed_count": 0,
+            "live_count": 0,
+            "started_count": 0,
+            "events": pd.DataFrame(),
+            "completed_df": pd.DataFrame(),
+            "message": str(e)[:160],
+        }
+
+
+def replace_worldcup_results_with_canonical(results_df, force=False):
+    """
+    Reemplaza los resultados del Mundial 2026 dentro del dataset por la fuente canónica:
+    1) fuente pública automática si está disponible,
+    2) calendario interno/manual estricto si la fuente pública no responde.
+
+    Así el entrenamiento, mapa, precisión y campeón usan los mismos partidos.
+    """
+    if results_df is None or results_df.empty:
+        base = pd.DataFrame()
+    else:
+        base = results_df.copy()
+
+    public = automatic_worldcup_public_count(force=force)
+    canonical = public.get("completed_df", pd.DataFrame())
+
+    if canonical is None or canonical.empty:
+        # Fallback al conteo estricto existente.
+        try:
+            summary = worldcup_played_count_summary(base)
+            canonical = summary.get("df", pd.DataFrame())
+        except Exception:
+            canonical = pd.DataFrame()
+
+    if canonical is None or canonical.empty:
+        return base, public
+
+    try:
+        non_wc = base.loc[~base.apply(_is_worldcup_2026_match, axis=1)].copy()
+    except Exception:
+        non_wc = base.copy()
+
+    combined = pd.concat([non_wc, canonical], ignore_index=True)
+    combined = dedupe_results_by_match(combined)
+    return combined, public
 
 
 
@@ -1326,17 +1550,184 @@ def load_stable_artifact():
         return None
 
 
-def save_worldcup_snapshot(results_df):
-    """Congela snapshot de resultados del Mundial 2026 usado por el modelo."""
+def is_final_match_status(status):
+    """Normaliza estados finalizados de API, calendario interno y CSV manual."""
+    s = str(status or "").strip().lower()
+    return s in {
+        "complete", "completed", "final", "finished", "ft", "aet", "pen",
+        "match finished", "after extra time", "penalties"
+    }
+
+
+def strict_completed_worldcup_matches(df):
+    """
+    Devuelve solo partidos REALMENTE finalizados del Mundial 2026.
+    Evita contar Scheduled/Live/NS y evita duplicados por fixture_id o equipos-fecha.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+
+    for col in ["home_team", "away_team"]:
+        if col in out.columns:
+            out[col] = out[col].map(normalize_team_name)
+
+    for col in ["home_score", "away_score"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    # 1) Mundial 2026 y equipos del torneo
     try:
-        wc = get_worldcup_2026_results(results_df)
+        mask_wc = out.apply(_is_worldcup_2026_match, axis=1)
+        out = out.loc[mask_wc].copy()
+    except Exception:
+        pass
+
+    teams = set(WC_2026_TEAMS)
+    out = out[out["home_team"].isin(teams) & out["away_team"].isin(teams)].copy()
+    out = out.dropna(subset=["date", "home_score", "away_score"]).copy()
+
+    # 2) Estado finalizado. Si no hay columna status, aceptamos como final solo si ya tiene marcador y fecha no futura.
+    if "status" in out.columns:
+        out["__is_final"] = out["status"].map(is_final_match_status)
+    else:
+        out["__is_final"] = True
+
+    today_cutoff = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+    out = out[(out["__is_final"]) & (out["date"] < today_cutoff)].copy()
+
+    # 3) Deduplicación fuerte.
+    if "fixture_id" in out.columns:
+        out["fixture_id"] = pd.to_numeric(out["fixture_id"], errors="coerce")
+        with_id = out.dropna(subset=["fixture_id"]).copy()
+        without_id = out[out["fixture_id"].isna()].copy()
+        with_id = with_id.sort_values(["date"]).drop_duplicates(subset=["fixture_id"], keep="last")
+        out = pd.concat([with_id, without_id], ignore_index=True)
+
+    out["__team_min"] = out[["home_team", "away_team"]].min(axis=1)
+    out["__team_max"] = out[["home_team", "away_team"]].max(axis=1)
+    out["__date_key"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+    out = out.sort_values(["date"]).drop_duplicates(
+        subset=["__date_key", "__team_min", "__team_max"],
+        keep="last"
+    )
+
+    out = out.drop(columns=["__is_final", "__team_min", "__team_max", "__date_key"], errors="ignore")
+    return out.sort_values("date").reset_index(drop=True)
+
+
+def get_official_played_count_override():
+    """
+    Conteo manual/verificado opcional desde Secrets.
+    Úsalo cuando la API gratuita no tenga cobertura actual del Mundial:
+    WORLD_CUP_2026_PLAYED_COUNT = "42"
+    """
+    for key in ["WORLD_CUP_2026_PLAYED_COUNT", "MUNDIAL_2026_PARTIDOS_JUGADOS", "WC2026_PLAYED_COUNT"]:
+        raw = str(get_config_value(key, "") or "").strip()
+        if raw:
+            try:
+                return int(raw)
+            except Exception:
+                pass
+    return None
+
+
+def worldcup_played_count_summary(results_df=None, force_public=False):
+    """
+    Resume el conteo canónico de partidos finalizados del Mundial 2026.
+
+    Prioridad automática:
+    1) fuente pública gratuita ESPN, si responde con eventos del Mundial;
+    2) calendario interno + datos cargados estrictamente finalizados;
+    3) override de Secrets solo como respaldo opcional, no necesario.
+    """
+    # 1) Fuente pública automática.
+    public = automatic_worldcup_public_count(force=force_public)
+    if public.get("ok") and public.get("completed_count", 0) > 0:
+        completed_df = public.get("completed_df", pd.DataFrame())
+        return {
+            "count": int(public.get("completed_count", 0)),
+            "loaded_count": int(public.get("completed_count", 0)),
+            "live_count": int(public.get("live_count", 0)),
+            "started_count": int(public.get("started_count", 0)),
+            "df": completed_df,
+            "source": public.get("source", "fuente pública automática"),
+            "warning": "" if public.get("live_count", 0) == 0 else f"{public.get('live_count', 0)} partido(s) en vivo no se usan para entrenar hasta finalizar.",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "public_message": public.get("message", ""),
+        }
+
+    # 2) Fallback con calendario interno + resultados cargados.
+    internal = pd.DataFrame()
+    loaded = pd.DataFrame()
+
+    try:
+        internal = strict_completed_worldcup_matches(load_internal_wc_results())
+    except Exception:
+        internal = pd.DataFrame()
+
+    try:
+        loaded = strict_completed_worldcup_matches(results_df)
+    except Exception:
+        loaded = pd.DataFrame()
+
+    frames = []
+    if not internal.empty:
+        internal["__source_count"] = "calendario_interno"
+        frames.append(internal)
+    if not loaded.empty:
+        loaded["__source_count"] = "datos_cargados"
+        frames.append(loaded)
+
+    if frames:
+        combined = pd.concat(frames, ignore_index=True)
+        combined = strict_completed_worldcup_matches(combined)
+    else:
+        combined = pd.DataFrame()
+
+    source = "calendario/datos"
+    override = get_official_played_count_override()
+    raw_count = int(len(combined)) if combined is not None else 0
+    adjusted = combined
+    warning = ""
+
+    # 3) Override queda disponible solo como plan B cuando ninguna fuente pública responde.
+    if override is not None:
+        source = "Secrets WORLD_CUP_2026_PLAYED_COUNT"
+        if raw_count > override:
+            adjusted = combined.sort_values("date").head(override).copy()
+            warning = f"El conteo cargado ({raw_count}) superaba el verificado ({override}); se recortó a {override}."
+        elif raw_count < override:
+            warning = f"El modelo solo tiene {raw_count} partidos cargados, pero el conteo verificado es {override}. Actualiza calendario/manual/API."
+        raw_count = override
+
+    return {
+        "count": int(raw_count),
+        "loaded_count": int(len(combined)) if combined is not None else 0,
+        "live_count": 0,
+        "started_count": int(raw_count),
+        "df": adjusted if adjusted is not None else pd.DataFrame(),
+        "source": source,
+        "warning": warning or public.get("message", ""),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "public_message": public.get("message", ""),
+    }
+
+
+def save_worldcup_snapshot(results_df):
+    """Congela snapshot estricto de partidos finalizados del Mundial 2026 usado por el modelo."""
+    try:
+        summary = worldcup_played_count_summary(results_df)
+        wc = summary.get("df", pd.DataFrame())
         if wc is not None and not wc.empty:
             wc.to_csv(WC_SNAPSHOT_FILE, index=False)
-            return True, len(wc)
-        return False, 0
-    except Exception:
-        return False, 0
-
+            return True, int(len(wc)), summary
+        return False, 0, summary
+    except Exception as e:
+        return False, 0, {"count": 0, "loaded_count": 0, "source": "error", "warning": str(e)[:150]}
 
 
 class TeamMemory:
@@ -2171,6 +2562,69 @@ def make_calibrated_logistic():
         return CalibratedClassifierCV(base_estimator=base, method="sigmoid", cv=3)
 
 
+
+def select_official_model_by_composite(metrics_df, fitted):
+    """
+    Selecciona un modelo oficial de forma determinística usando una puntuación compuesta.
+    Esto busca equilibrio entre:
+    - accuracy,
+    - f1_weighted,
+    - log_loss,
+    - brier_score.
+
+    No usa azar; por eso conserva estabilidad entre ejecuciones.
+    """
+    if metrics_df is None or metrics_df.empty:
+        return next(iter(fitted.keys()))
+
+    m = metrics_df.copy()
+    m = m[m["modelo"].isin(list(fitted.keys()))].copy()
+    if m.empty:
+        return next(iter(fitted.keys()))
+
+    # Reemplazos seguros para métricas faltantes.
+    for col in ["accuracy", "f1_weighted", "log_loss", "brier_score"]:
+        if col not in m.columns:
+            m[col] = np.nan
+
+    m["accuracy_s"] = m["accuracy"].fillna(m["accuracy"].median() if m["accuracy"].notna().any() else 0.0)
+    m["f1_s"] = m["f1_weighted"].fillna(m["f1_weighted"].median() if m["f1_weighted"].notna().any() else 0.0)
+
+    # Para log_loss y brier, menor es mejor. Convertimos a puntaje positivo.
+    ll = m["log_loss"].copy()
+    br = m["brier_score"].copy()
+    ll_fill = ll.max() if ll.notna().any() else 1.5
+    br_fill = br.max() if br.notna().any() else 0.8
+    m["logloss_s"] = 1.0 / (1.0 + ll.fillna(ll_fill))
+    m["brier_s"] = 1.0 / (1.0 + br.fillna(br_fill))
+
+    # Penalización suave por modelos más volátiles en datasets pequeños.
+    volatility_penalty = {
+        "Red neuronal simple": 0.020,
+        "XGBoost": 0.010,
+        "Random Forest": 0.005,
+    }
+    m["penalty"] = m["modelo"].map(volatility_penalty).fillna(0.0)
+
+    m["official_score"] = (
+        0.40 * m["accuracy_s"] +
+        0.25 * m["f1_s"] +
+        0.22 * m["logloss_s"] +
+        0.13 * m["brier_s"] -
+        m["penalty"]
+    )
+
+    # Si el modelo calibrado está cerca del ganador, preferirlo por estabilidad de probabilidades.
+    best_row = m.sort_values("official_score", ascending=False).iloc[0]
+    if OFFICIAL_MODEL_NAME in m["modelo"].values:
+        calib_row = m[m["modelo"] == OFFICIAL_MODEL_NAME].iloc[0]
+        if float(best_row["official_score"]) - float(calib_row["official_score"]) <= 0.015:
+            return OFFICIAL_MODEL_NAME
+
+    return str(best_row["modelo"])
+
+
+
 def train_and_compare(features_df, feature_cols):
     """
     Entrena modelos con split temporal aproximado.
@@ -2254,9 +2708,9 @@ def train_and_compare(features_df, feature_cols):
 
     best_model = fitted[best_name]
 
-    # Modelo oficial fijo para producción: evita que la predicción pública cambie
-    # si otro modelo gana por una pequeña variación de validación.
-    official_model_name = OFFICIAL_MODEL_NAME if OFFICIAL_MODEL_NAME in fitted else best_name
+    # Modelo oficial de producción: determinístico por puntuación compuesta.
+    # Mejora precisión manteniendo estabilidad entre ejecuciones.
+    official_model_name = select_official_model_by_composite(metrics_df, fitted)
     official_model = fitted[official_model_name]
 
     goal_best_name, goal_best_model, goal_metrics = train_goal_regressors(train_df, test_df, feature_cols)
@@ -3446,42 +3900,21 @@ def dedupe_results_by_match(results_df):
 
 def get_worldcup_2026_results(results_df, teams=None):
     """
-    Fuente canónica de partidos jugados del Mundial 2026.
-    Combina:
-    - calendario interno actualizado,
-    - resultados que ya estén cargados en results_df,
-    - deduplicación por fecha + equipos.
-
-    Esta función es la que deben usar campeón, mapa, Monte Carlo y precisión.
+    Fuente canónica y estricta de partidos FINALIZADOS del Mundial 2026.
+    Usa calendario interno + resultados cargados + deduplicación.
+    Si hay WORLD_CUP_2026_PLAYED_COUNT en Secrets, respeta ese conteo.
     """
+    summary = worldcup_played_count_summary(results_df)
+    wc = summary.get("df", pd.DataFrame()).copy()
+
     if teams is None:
         teams = WC_2026_TEAMS
     teams = set(teams)
 
-    frames = []
-
-    try:
-        internal_wc = load_internal_wc_results()
-        if internal_wc is not None and not internal_wc.empty:
-            frames.append(internal_wc)
-    except Exception:
-        pass
-
-    if results_df is not None and not results_df.empty:
-        df = results_df.copy()
-        mask = df.apply(_is_worldcup_2026_match, axis=1)
-        df = df.loc[mask].copy()
-        if not df.empty:
-            frames.append(df)
-
-    if not frames:
+    if wc is None or wc.empty:
         return pd.DataFrame()
 
-    wc = pd.concat(frames, ignore_index=True)
     wc = wc[wc["home_team"].isin(teams) & wc["away_team"].isin(teams)].copy()
-    wc = wc.dropna(subset=["home_score", "away_score"])
-    wc = dedupe_results_by_match(wc)
-
     return wc.sort_values("date").reset_index(drop=True)
 
 
@@ -4225,8 +4658,30 @@ def compute_data_quality_index(auto_sources, advanced_context, prediction, mem, 
     details.append(("Fixture/sede", fixture_score, fixture_msg))
 
     goal_model_ok = prediction.get("lambda_override") is not None
-    score += 15 if goal_model_ok else 8
-    details.append(("Modelo de goles", 15 if goal_model_ok else 8, "Regresor de goles activo" if goal_model_ok else "Solo Poisson/ML"))
+    score += 12 if goal_model_ok else 6
+    details.append(("Modelo de goles", 12 if goal_model_ok else 6, "Regresor de goles activo" if goal_model_ok else "Solo Poisson/ML"))
+
+    # Coherencia del conteo de partidos del Mundial 2026.
+    try:
+        wc_summary = worldcup_played_count_summary(st.session_state.get("results") if STREAMLIT_OK else None)
+        override_count = get_official_played_count_override()
+        if override_count is not None and wc_summary.get("loaded_count", 0) == override_count:
+            wc_score = 13
+            wc_msg = f"Conteo verificado: {override_count} partidos"
+        elif override_count is not None and wc_summary.get("loaded_count", 0) != override_count:
+            wc_score = 7
+            wc_msg = f"Verificado {override_count}; cargados {wc_summary.get('loaded_count', 0)}"
+        elif wc_summary.get("loaded_count", 0) >= 1:
+            wc_score = 10
+            wc_msg = f"Conteo por calendario/datos: {wc_summary.get('loaded_count', 0)}"
+        else:
+            wc_score = 4
+            wc_msg = "Sin conteo del Mundial confirmado"
+    except Exception:
+        wc_score = 6
+        wc_msg = "No se pudo validar conteo Mundial"
+    score += wc_score
+    details.append(("Conteo Mundial 2026", wc_score, wc_msg))
 
     final_score = int(clamp(score, 0, 100))
     if final_score >= 80:
@@ -5562,6 +6017,19 @@ def streamlit_app():
             progress_bar.progress(48, text="48% · Limpiando datos...")
             results = dedupe_results_by_match(results)
 
+            # Canonicaliza Mundial 2026: todo el programa usa los mismos partidos finalizados reales.
+            try:
+                results, public_count_info = replace_worldcup_results_with_canonical(results, force=force_update)
+                if public_count_info.get("ok"):
+                    api_status = (
+                        f"{api_status} | Conteo automático Mundial 2026: "
+                        f"{public_count_info.get('completed_count', 0)} finalizados"
+                        f"{' + ' + str(public_count_info.get('live_count', 0)) + ' en vivo' if public_count_info.get('live_count', 0) else ''} "
+                        f"(fuente: {public_count_info.get('source', 'pública')})."
+                    )
+            except Exception as e:
+                api_status = f"{api_status} | No se pudo canonicalizar conteo Mundial: {str(e)[:100]}"
+
             status_box.markdown('<div class="step-box">🧠 Construyendo variables: Elo, forma reciente, goles y descanso...</div>', unsafe_allow_html=True)
             progress_bar.progress(65, text="65% · Construyendo variables del modelo...")
             features_df, feature_cols, mem = build_features_from_results(results, min_year=min_year)
@@ -5574,12 +6042,17 @@ def streamlit_app():
             progress_bar.progress(95, text="95% · Preparando resultados...")
 
             # Congelar snapshot y guardar artefacto estable.
-            snapshot_ok, wc_snapshot_rows = save_worldcup_snapshot(results)
+            snapshot_ok, wc_snapshot_rows, wc_count_summary = save_worldcup_snapshot(results)
             artifact_ok, artifact_meta = save_stable_artifact(training_result, results, mem, min_year, api_status=api_status)
             if artifact_ok:
                 api_status = f"{api_status} | Modelo estable guardado: {MODEL_VERSION}."
             if snapshot_ok:
-                api_status = f"{api_status} | Snapshot Mundial 2026: {wc_snapshot_rows} partidos."
+                api_status = (
+                    f"{api_status} | Snapshot Mundial 2026: {wc_snapshot_rows} partidos finalizados "
+                    f"(fuente: {wc_count_summary.get('source', 'desconocida')})."
+                )
+            if wc_count_summary.get("warning"):
+                api_status = f"{api_status} | Aviso conteo: {wc_count_summary.get('warning')}"
 
             st.session_state.training_result = training_result
             st.session_state.results = results
@@ -5618,6 +6091,21 @@ def streamlit_app():
         "Modo producción estable: las predicciones públicas usan el modelo oficial fijo. "
         "La comparación de modelos queda como auditoría interna."
     )
+
+    try:
+        wc_summary_view = worldcup_played_count_summary(results)
+        wc_msg = (
+            f"🌎 Mundial 2026: {wc_summary_view.get('count', 0)} partidos finalizados"
+            f"{' + ' + str(wc_summary_view.get('live_count', 0)) + ' en vivo' if wc_summary_view.get('live_count', 0) else ''} "
+            f"(iniciados/jugados: {wc_summary_view.get('started_count', wc_summary_view.get('count', 0))} · "
+            f"fuente: {wc_summary_view.get('source', 'desconocida')})."
+        )
+        if wc_summary_view.get("warning"):
+            st.warning(wc_msg + " " + wc_summary_view.get("warning", ""))
+        else:
+            st.info(wc_msg)
+    except Exception:
+        pass
 
     st.divider()
 
