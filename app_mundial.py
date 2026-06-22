@@ -17,6 +17,8 @@ import os
 import json
 import math
 import warnings
+import random
+import pickle
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -46,6 +48,14 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import PoissonRegressor, Ridge
+
+try:
+    import joblib
+    JOBLIB_OK = True
+except Exception:
+    joblib = None
+    JOBLIB_OK = False
+
 
 warnings.filterwarnings("ignore")
 
@@ -104,6 +114,21 @@ WORLD_CUP_LEAGUE_ID = 1
 WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
+SEED = RANDOM_STATE
+MODEL_VERSION = "V23_ESTABLE_PRODUCCION"
+OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
+
+# Reproducibilidad global: reduce variaciones entre ejecuciones.
+os.environ["PYTHONHASHSEED"] = str(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+MODEL_DIR = Path("modelos")
+MODEL_DIR.mkdir(exist_ok=True)
+MODEL_ARTIFACT_PATH = MODEL_DIR / "modelo_oficial.pkl"
+MODEL_METADATA_PATH = MODEL_DIR / "metadata_modelo.json"
+WC_SNAPSHOT_FILE = DATA_DIR / "snapshot_mundial_2026.csv"
+
 
 # La precisión acumulada del Mundial se empieza a medir desde este partido hacia adelante.
 # El usuario pidió iniciar desde Japan vs Tunisia/Tunisia vs Japan.
@@ -1131,6 +1156,148 @@ def safe_streak_stats(mem, team, n=10):
 
 
 
+
+def model_proba_safe(model, X):
+    """Devuelve probabilidad 1x3 de forma segura."""
+    try:
+        if hasattr(model, "predict_proba"):
+            p = np.asarray(model.predict_proba(X)[0], dtype=float)
+        else:
+            pred = int(model.predict(X)[0])
+            p = np.array([0.0, 0.0, 0.0], dtype=float)
+            if 0 <= pred <= 2:
+                p[pred] = 1.0
+        p = np.clip(p, 1e-6, 1.0)
+        return p / p.sum()
+    except Exception:
+        return np.array([1/3, 1/3, 1/3], dtype=float)
+
+
+def compute_prediction_stability(training_result, X, max_models=6):
+    """
+    Mide cuánto varían las probabilidades entre modelos disponibles.
+    Menor variación = predicción más estable.
+    """
+    models = training_result.get("models", {}) if isinstance(training_result, dict) else {}
+    probas = []
+    names = []
+    for name, model in list(models.items())[:max_models]:
+        if hasattr(model, "predict_proba"):
+            try:
+                p = model_proba_safe(model, X)
+                if len(p) == 3 and np.all(np.isfinite(p)):
+                    probas.append(p)
+                    names.append(name)
+            except Exception:
+                pass
+
+    if len(probas) < 2:
+        return {
+            "label": "Media",
+            "variation_pct": 0.0,
+            "models_used": len(probas),
+            "note": "No hay suficientes modelos comparables."
+        }
+
+    arr = np.vstack(probas)
+    std_mean = float(np.mean(np.std(arr, axis=0)))
+    variation_pct = round(std_mean * 100, 2)
+
+    if variation_pct <= 3:
+        label = "Alta"
+    elif variation_pct <= 7:
+        label = "Media"
+    else:
+        label = "Baja"
+
+    return {
+        "label": label,
+        "variation_pct": variation_pct,
+        "models_used": len(probas),
+        "note": f"Variación promedio entre modelos: {variation_pct}%"
+    }
+
+
+def compute_training_stability_summary(training_result):
+    """Estabilidad promedio sobre el set de prueba temporal."""
+    try:
+        X_test = training_result.get("X_test")
+        if X_test is None or len(X_test) == 0:
+            return {"label": "Media", "variation_pct": 0.0, "models_used": 0}
+        sample = X_test.head(min(200, len(X_test)))
+        vals = [compute_prediction_stability(training_result, sample.iloc[[i]])["variation_pct"] for i in range(len(sample))]
+        avg = float(np.mean(vals)) if vals else 0.0
+        if avg <= 3:
+            label = "Alta"
+        elif avg <= 7:
+            label = "Media"
+        else:
+            label = "Baja"
+        return {"label": label, "variation_pct": round(avg, 2), "models_used": len(training_result.get("models", {}))}
+    except Exception:
+        return {"label": "Media", "variation_pct": 0.0, "models_used": 0}
+
+
+def save_stable_artifact(training_result, results, mem, min_year, api_status=""):
+    """
+    Guarda artefacto de producción para que la app pueda trabajar con un modelo estable.
+    En Streamlit Cloud el archivo puede ser temporal; localmente puedes versionarlo si lo deseas.
+    """
+    try:
+        metadata = {
+            "model_version": MODEL_VERSION,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "official_model_name": training_result.get("official_model_name", OFFICIAL_MODEL_NAME),
+            "best_metric_model": training_result.get("best_name", ""),
+            "min_year": int(min_year),
+            "rows_training": int(len(training_result.get("features_df", []))),
+            "matches_loaded": int(len(results)) if results is not None else 0,
+            "api_status": str(api_status),
+            "stability": training_result.get("stability_summary", {}),
+        }
+        artifact = {
+            "training_result": training_result,
+            "results": results,
+            "mem": mem,
+            "metadata": metadata,
+        }
+        if JOBLIB_OK:
+            joblib.dump(artifact, MODEL_ARTIFACT_PATH)
+        else:
+            with open(MODEL_ARTIFACT_PATH, "wb") as f:
+                pickle.dump(artifact, f)
+        MODEL_METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True, metadata
+    except Exception as e:
+        return False, {"error": str(e)[:180]}
+
+
+def load_stable_artifact():
+    """Carga artefacto estable guardado si existe."""
+    if not MODEL_ARTIFACT_PATH.exists():
+        return None
+    try:
+        if JOBLIB_OK:
+            return joblib.load(MODEL_ARTIFACT_PATH)
+        with open(MODEL_ARTIFACT_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def save_worldcup_snapshot(results_df):
+    """Congela snapshot de resultados del Mundial 2026 usado por el modelo."""
+    try:
+        wc = get_worldcup_2026_results(results_df)
+        if wc is not None and not wc.empty:
+            wc.to_csv(WC_SNAPSHOT_FILE, index=False)
+            return True, len(wc)
+        return False, 0
+    except Exception:
+        return False, 0
+
+
+
 class TeamMemory:
     """
     Guarda historial previo de cada selección para calcular features antes de cada partido.
@@ -1443,11 +1610,34 @@ def build_ensemble_weights(metrics_df):
 
 
 def ensemble_predict_proba(training_result, X):
-    """Predice probabilidades con ensamble ponderado; fallback al mejor modelo."""
+    """
+    Predice probabilidades.
+    En modo producción usa un modelo oficial fijo para evitar variaciones públicas.
+    El ensamble queda como auxiliar/análisis interno.
+    """
+    prediction_mode = training_result.get("prediction_mode", "oficial_estable")
+
+    if prediction_mode == "oficial_estable":
+        model = (
+            training_result.get("official_model")
+            or training_result.get("models", {}).get(training_result.get("official_model_name", OFFICIAL_MODEL_NAME))
+            or training_result.get("best_model")
+        )
+        official_name = training_result.get("official_model_name", OFFICIAL_MODEL_NAME)
+        p = model_proba_safe(model, X)
+        stability = compute_prediction_stability(training_result, X)
+        return p, {
+            "mode": "modelo_oficial_estable",
+            "weights_used": {official_name: 1.0},
+            "stability": stability,
+        }
+
     models = training_result.get("models", {})
     weights = training_result.get("ensemble_weights", {})
     probs = []
+    used_names = []
     used_weights = []
+
     for name, w in weights.items():
         model = models.get(name)
         if model is None or not hasattr(model, "predict_proba"):
@@ -1456,25 +1646,30 @@ def ensemble_predict_proba(training_result, X):
             p = np.asarray(model.predict_proba(X)[0], dtype=float)
             if len(p) == 3 and np.all(np.isfinite(p)):
                 probs.append(p)
+                used_names.append(name)
                 used_weights.append(float(w))
         except Exception:
             continue
+
     if probs:
         W = np.asarray(used_weights, dtype=float)
         W = W / W.sum()
         out = np.average(np.vstack(probs), axis=0, weights=W)
         out = np.clip(out, 1e-6, 1.0)
-        return out / out.sum(), {"mode": "ensemble", "weights_used": dict(zip([k for k in weights.keys()][:len(W)], W.tolist()))}
+        stability = compute_prediction_stability(training_result, X)
+        return out / out.sum(), {
+            "mode": "ensemble_estable",
+            "weights_used": dict(zip(used_names, W.tolist())),
+            "stability": stability,
+        }
 
     model = training_result["best_model"]
-    if hasattr(model, "predict_proba"):
-        p = np.asarray(model.predict_proba(X)[0], dtype=float)
-    else:
-        pred = model.predict(X)[0]
-        p = np.array([0.0, 0.0, 0.0])
-        p[pred] = 1.0
-    p = np.clip(p, 1e-6, 1.0)
-    return p / p.sum(), {"mode": "best_model", "weights_used": {training_result.get("best_name", "best"): 1.0}}
+    p = model_proba_safe(model, X)
+    return p, {
+        "mode": "best_model_fallback",
+        "weights_used": {training_result.get("best_name", "best"): 1.0},
+        "stability": compute_prediction_stability(training_result, X),
+    }
 
 
 def apply_draw_probability_adjustment(ml_probs, row, lam_a=None, lam_b=None):
@@ -1961,6 +2156,11 @@ def train_and_compare(features_df, feature_cols):
 
     best_model = fitted[best_name]
 
+    # Modelo oficial fijo para producción: evita que la predicción pública cambie
+    # si otro modelo gana por una pequeña variación de validación.
+    official_model_name = OFFICIAL_MODEL_NAME if OFFICIAL_MODEL_NAME in fitted else best_name
+    official_model = fitted[official_model_name]
+
     goal_best_name, goal_best_model, goal_metrics = train_goal_regressors(train_df, test_df, feature_cols)
     ensemble_weights = build_ensemble_weights(metrics_df)
 
@@ -1975,11 +2175,22 @@ def train_and_compare(features_df, feature_cols):
         "metrics": metrics_df,
         "best_name": best_name,
         "best_model": best_model,
+        "official_model_name": official_model_name,
+        "official_model": official_model,
+        "prediction_mode": "oficial_estable",
+        "model_version": MODEL_VERSION,
+        "model_created_at": datetime.now().isoformat(timespec="seconds"),
+        "train_start": str(train_df["date"].min().date()) if not train_df.empty else "",
+        "train_end": str(train_df["date"].max().date()) if not train_df.empty else "",
+        "test_start": str(test_df["date"].min().date()) if not test_df.empty else "",
+        "test_end": str(test_df["date"].max().date()) if not test_df.empty else "",
         "goal_best_name": goal_best_name,
         "goal_best_model": goal_best_model,
         "goal_metrics": goal_metrics,
         "ensemble_weights": ensemble_weights,
     }
+
+    result["stability_summary"] = compute_training_stability_summary(result)
 
     return result
 
@@ -4923,7 +5134,16 @@ def streamlit_app():
         "entrenar modelos y generar resultados."
     )
 
-    ejecutar = st.button("🚀 Ejecutar análisis y entrenar modelos", type="primary", use_container_width=True)
+    c_run, c_load = st.columns([3, 1])
+    with c_run:
+        ejecutar = st.button("🚀 Reentrenar modelo estable", type="primary", use_container_width=True)
+    with c_load:
+        cargar_guardado = st.button(
+            "📦 Cargar guardado",
+            use_container_width=True,
+            disabled=not MODEL_ARTIFACT_PATH.exists(),
+            help="Carga modelos/modelo_oficial.pkl si existe."
+        )
 
     if "training_result" not in st.session_state:
         st.session_state.training_result = None
@@ -4931,6 +5151,18 @@ def streamlit_app():
         st.session_state.mem = None
         st.session_state.api_status = None
         st.session_state.min_year = None
+
+    if cargar_guardado:
+        artifact = load_stable_artifact()
+        if artifact:
+            st.session_state.training_result = artifact.get("training_result")
+            st.session_state.results = artifact.get("results")
+            st.session_state.mem = artifact.get("mem")
+            st.session_state.api_status = "Modelo estable cargado desde archivo guardado."
+            st.session_state.min_year = artifact.get("metadata", {}).get("min_year", min_year)
+            st.success("✅ Modelo estable guardado cargado correctamente.")
+        else:
+            st.warning("No se pudo cargar el modelo guardado. Reentrena el modelo.")
 
     if ejecutar:
         progress_bar = st.progress(0, text="0% · Preparando análisis...")
@@ -5004,6 +5236,14 @@ def streamlit_app():
             status_box.markdown('<div class="step-box">📊 Preparando interfaz de resultados...</div>', unsafe_allow_html=True)
             progress_bar.progress(95, text="95% · Preparando resultados...")
 
+            # Congelar snapshot y guardar artefacto estable.
+            snapshot_ok, wc_snapshot_rows = save_worldcup_snapshot(results)
+            artifact_ok, artifact_meta = save_stable_artifact(training_result, results, mem, min_year, api_status=api_status)
+            if artifact_ok:
+                api_status = f"{api_status} | Modelo estable guardado: {MODEL_VERSION}."
+            if snapshot_ok:
+                api_status = f"{api_status} | Snapshot Mundial 2026: {wc_snapshot_rows} partidos."
+
             st.session_state.training_result = training_result
             st.session_state.results = results
             st.session_state.mem = mem
@@ -5029,11 +5269,18 @@ def streamlit_app():
 
     st.success(api_status)
 
-    colA, colB, colC, colD = st.columns(4)
+    colA, colB, colC, colD, colE, colF = st.columns(6)
     colA.metric("Partidos cargados", f"{len(results):,}")
-    colB.metric("Filas de entrenamiento", f"{len(training_result['features_df']):,}")
-    colC.metric("Mejor modelo", training_result["best_name"])
-    colD.metric("Desde el año", str(st.session_state.min_year))
+    colB.metric("Filas entrenamiento", f"{len(training_result['features_df']):,}")
+    colC.metric("Modelo oficial", training_result.get("official_model_name", training_result.get("best_name", "")))
+    colD.metric("Mejor en validación", training_result.get("best_name", ""))
+    stability_summary = training_result.get("stability_summary", {})
+    colE.metric("Estabilidad", stability_summary.get("label", "Media"), f"{stability_summary.get('variation_pct', 0)}% var.")
+    colF.metric("Versión", training_result.get("model_version", MODEL_VERSION))
+    st.caption(
+        "Modo producción estable: las predicciones públicas usan el modelo oficial fijo. "
+        "La comparación de modelos queda como auditoría interna."
+    )
 
     st.divider()
 
@@ -5258,12 +5505,14 @@ def streamlit_app():
         "y juega en su propio país."
     )
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric(f"Victoria {team_a}", f"{probs['victoria_A']*100:.1f}%")
     m2.metric("Empate", f"{probs['empate']*100:.1f}%")
     m3.metric(f"Victoria {team_b}", f"{probs['victoria_B']*100:.1f}%")
     m4.metric(f"Goles esperados {team_a}", f"{prediction['lambda_a']:.2f}")
     m5.metric(f"Goles esperados {team_b}", f"{prediction['lambda_b']:.2f}")
+    stability = prediction.get("ensemble_info", {}).get("stability", {})
+    m6.metric("Estabilidad predicción", stability.get("label", "Media"), f"{stability.get('variation_pct', 0)}% var.")
 
     st.caption(
         "Las probabilidades de victoria/empate/derrota se calculan con la matriz final de marcadores "
@@ -5465,6 +5714,21 @@ def streamlit_app():
 
     with tab3:
         st.subheader("Comparación de modelos")
+
+        st.markdown("### Modo producción estable")
+        meta_df = pd.DataFrame([
+            {"Campo": "Modelo oficial usado en predicciones", "Valor": training_result.get("official_model_name", "")},
+            {"Campo": "Mejor modelo en validación", "Valor": training_result.get("best_name", "")},
+            {"Campo": "Versión del modelo", "Valor": training_result.get("model_version", MODEL_VERSION)},
+            {"Campo": "Creado / reentrenado", "Valor": training_result.get("model_created_at", "")},
+            {"Campo": "Train temporal", "Valor": f"{training_result.get('train_start', '')} → {training_result.get('train_end', '')}"},
+            {"Campo": "Test temporal", "Valor": f"{training_result.get('test_start', '')} → {training_result.get('test_end', '')}"},
+            {"Campo": "Estabilidad promedio", "Valor": f"{training_result.get('stability_summary', {}).get('label', 'Media')} ({training_result.get('stability_summary', {}).get('variation_pct', 0)}% var.)"},
+            {"Campo": "Archivo modelo", "Valor": str(MODEL_ARTIFACT_PATH)},
+            {"Campo": "Snapshot Mundial", "Valor": str(WC_SNAPSHOT_FILE)},
+        ])
+        st.dataframe(safe_streamlit_df(meta_df), use_container_width=True, hide_index=True)
+
         metrics = training_result["metrics"].copy()
         for col in ["accuracy", "f1_weighted", "log_loss", "brier_score"]:
             if col in metrics.columns:
