@@ -1,9 +1,8 @@
-pandas
-numpy
-requests
-scipy
-scikit-learn
-matplotlib
-streamlit
-# Opcional:
-# xgboost
+streamlit>=1.33,<2
+pandas>=2.0,<3
+numpy>=1.24,<3
+requests>=2.31,<3
+matplotlib>=3.7,<4
+scipy>=1.10,<2
+scikit-learn>=1.4,<1.7
+xgboost>=2.0,<3

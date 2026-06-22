@@ -1318,7 +1318,7 @@ def get_models():
     models = {
         "Logistic Regression": Pipeline([
             ("scaler", StandardScaler()),
-            ("model", LogisticRegression(max_iter=1500, multi_class="auto"))
+            ("model", LogisticRegression(max_iter=1500))
         ]),
         "Random Forest": RandomForestClassifier(
             n_estimators=350,
@@ -1464,7 +1464,7 @@ def make_calibrated_logistic():
     """Crea Logistic Regression calibrada, compatible con versiones distintas de sklearn."""
     base = Pipeline([
         ("scaler", StandardScaler()),
-        ("lr", LogisticRegression(max_iter=1500, multi_class="auto"))
+        ("lr", LogisticRegression(max_iter=1500))
     ])
     try:
         return CalibratedClassifierCV(estimator=base, method="sigmoid", cv=3)
