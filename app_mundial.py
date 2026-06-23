@@ -81,22 +81,22 @@ CACHE_DIR.mkdir(exist_ok=True)
 # Sedes aproximadas Mundial 2026 para clima y altitud.
 # Valores aproximados para análisis educativo. El usuario puede escoger la sede en la app.
 WORLD_CUP_2026_VENUES = {
-    "Atlanta, United States": {"country": "United States", "city": "Atlanta", "lat": 33.755, "lon": -84.401, "altitude_m": 320},
-    "Boston/Foxborough, United States": {"country": "United States", "city": "Foxborough", "lat": 42.091, "lon": -71.264, "altitude_m": 90},
-    "Dallas/Arlington, United States": {"country": "United States", "city": "Arlington", "lat": 32.747, "lon": -97.092, "altitude_m": 190},
-    "Houston, United States": {"country": "United States", "city": "Houston", "lat": 29.684, "lon": -95.411, "altitude_m": 15},
-    "Kansas City, United States": {"country": "United States", "city": "Kansas City", "lat": 39.049, "lon": -94.484, "altitude_m": 265},
-    "Los Angeles/Inglewood, United States": {"country": "United States", "city": "Inglewood", "lat": 33.953, "lon": -118.339, "altitude_m": 40},
-    "Miami, United States": {"country": "United States", "city": "Miami Gardens", "lat": 25.958, "lon": -80.239, "altitude_m": 2},
-    "New York/New Jersey, United States": {"country": "United States", "city": "East Rutherford", "lat": 40.813, "lon": -74.074, "altitude_m": 10},
-    "Philadelphia, United States": {"country": "United States", "city": "Philadelphia", "lat": 39.901, "lon": -75.168, "altitude_m": 12},
-    "San Francisco Bay Area, United States": {"country": "United States", "city": "Santa Clara", "lat": 37.403, "lon": -121.970, "altitude_m": 5},
-    "Seattle, United States": {"country": "United States", "city": "Seattle", "lat": 47.595, "lon": -122.331, "altitude_m": 60},
-    "Guadalajara, Mexico": {"country": "Mexico", "city": "Guadalajara", "lat": 20.666, "lon": -103.341, "altitude_m": 1566},
-    "Mexico City, Mexico": {"country": "Mexico", "city": "Mexico City", "lat": 19.303, "lon": -99.150, "altitude_m": 2240},
-    "Monterrey, Mexico": {"country": "Mexico", "city": "Monterrey", "lat": 25.668, "lon": -100.244, "altitude_m": 540},
-    "Toronto, Canada": {"country": "Canada", "city": "Toronto", "lat": 43.633, "lon": -79.419, "altitude_m": 76},
-    "Vancouver, Canada": {"country": "Canada", "city": "Vancouver", "lat": 49.276, "lon": -123.111, "altitude_m": 10},
+    "Atlanta, United States": {"country": "United States", "city": "Atlanta", "stadium": "Mercedes-Benz Stadium", "lat": 33.755, "lon": -84.401, "altitude_m": 320},
+    "Boston/Foxborough, United States": {"country": "United States", "city": "Foxborough", "stadium": "Gillette Stadium", "lat": 42.091, "lon": -71.264, "altitude_m": 90},
+    "Dallas/Arlington, United States": {"country": "United States", "city": "Arlington", "stadium": "AT&T Stadium", "lat": 32.747, "lon": -97.092, "altitude_m": 190},
+    "Houston, United States": {"country": "United States", "city": "Houston", "stadium": "NRG Stadium", "lat": 29.684, "lon": -95.411, "altitude_m": 15},
+    "Kansas City, United States": {"country": "United States", "city": "Kansas City", "stadium": "GEHA Field at Arrowhead Stadium", "lat": 39.049, "lon": -94.484, "altitude_m": 265},
+    "Los Angeles/Inglewood, United States": {"country": "United States", "city": "Inglewood", "stadium": "SoFi Stadium", "lat": 33.953, "lon": -118.339, "altitude_m": 40},
+    "Miami, United States": {"country": "United States", "city": "Miami Gardens", "stadium": "Hard Rock Stadium", "lat": 25.958, "lon": -80.239, "altitude_m": 2},
+    "New York/New Jersey, United States": {"country": "United States", "city": "East Rutherford", "stadium": "MetLife Stadium", "lat": 40.813, "lon": -74.074, "altitude_m": 10},
+    "Philadelphia, United States": {"country": "United States", "city": "Philadelphia", "stadium": "Lincoln Financial Field", "lat": 39.901, "lon": -75.168, "altitude_m": 12},
+    "San Francisco Bay Area, United States": {"country": "United States", "city": "Santa Clara", "stadium": "Levi's Stadium", "lat": 37.403, "lon": -121.970, "altitude_m": 5},
+    "Seattle, United States": {"country": "United States", "city": "Seattle", "stadium": "Lumen Field", "lat": 47.595, "lon": -122.331, "altitude_m": 60},
+    "Guadalajara, Mexico": {"country": "Mexico", "city": "Guadalajara", "stadium": "Estadio Akron", "lat": 20.666, "lon": -103.341, "altitude_m": 1566},
+    "Mexico City, Mexico": {"country": "Mexico", "city": "Mexico City", "stadium": "Estadio Azteca", "lat": 19.303, "lon": -99.150, "altitude_m": 2240},
+    "Monterrey, Mexico": {"country": "Mexico", "city": "Monterrey", "stadium": "Estadio BBVA", "lat": 25.668, "lon": -100.244, "altitude_m": 540},
+    "Toronto, Canada": {"country": "Canada", "city": "Toronto", "stadium": "BMO Field", "lat": 43.633, "lon": -79.419, "altitude_m": 76},
+    "Vancouver, Canada": {"country": "Canada", "city": "Vancouver", "stadium": "BC Place", "lat": 49.276, "lon": -123.111, "altitude_m": 10},
 }
 
 
@@ -115,7 +115,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V30_MARCADORES_TOP3"
+MODEL_VERSION = "V31_ESTADIO_AUTOMATICO"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -726,6 +726,302 @@ def find_internal_fixture(team_a, team_b, match_date=None):
         }
     except Exception:
         return None
+
+
+
+def normalize_venue_text(value):
+    """Normaliza texto de ciudad/estadio para comparar fuentes distintas."""
+    if value is None:
+        return ""
+    txt = str(value).lower()
+    txt = txt.replace("&", "and")
+    # quitar tildes simples
+    replacements = {
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ñ": "n",
+        "ç": "c", "ã": "a", "õ": "o", "ü": "u", "’": "'", "`": "'"
+    }
+    for a, b in replacements.items():
+        txt = txt.replace(a, b)
+    txt = re.sub(r"[^a-z0-9\\s]", " ", txt)
+    txt = re.sub(r"\\s+", " ", txt).strip()
+    return txt
+
+
+def venue_option_label(venue_key):
+    """Etiqueta profesional para mostrar en el selector."""
+    v = WORLD_CUP_2026_VENUES.get(venue_key, {})
+    stadium = v.get("stadium", "").strip()
+    city = v.get("city", "").strip()
+    country = v.get("country", "").strip()
+    if stadium:
+        return f"{stadium} · {city}, {country}"
+    return venue_key
+
+
+def match_venue_key_from_name_city(venue_name="", venue_city=""):
+    """
+    Convierte estadio/ciudad recibido de internet/API en una key interna.
+    Acepta coincidencias por nombre del estadio, ciudad o alias de ciudad sede.
+    """
+    vn = normalize_venue_text(venue_name)
+    vc = normalize_venue_text(venue_city)
+    combined = f"{vn} {vc}".strip()
+
+    if not combined:
+        return None
+
+    # Alias manuales para nombres comunes en distintas fuentes.
+    aliases = {
+        "mercedes benz stadium": "Atlanta, United States",
+        "atlanta": "Atlanta, United States",
+        "gillette stadium": "Boston/Foxborough, United States",
+        "foxborough": "Boston/Foxborough, United States",
+        "boston": "Boston/Foxborough, United States",
+        "at t stadium": "Dallas/Arlington, United States",
+        "att stadium": "Dallas/Arlington, United States",
+        "arlington": "Dallas/Arlington, United States",
+        "dallas": "Dallas/Arlington, United States",
+        "nrg stadium": "Houston, United States",
+        "houston": "Houston, United States",
+        "geha field at arrowhead stadium": "Kansas City, United States",
+        "arrowhead stadium": "Kansas City, United States",
+        "kansas city": "Kansas City, United States",
+        "sofi stadium": "Los Angeles/Inglewood, United States",
+        "inglewood": "Los Angeles/Inglewood, United States",
+        "los angeles": "Los Angeles/Inglewood, United States",
+        "hard rock stadium": "Miami, United States",
+        "miami gardens": "Miami, United States",
+        "miami": "Miami, United States",
+        "metlife stadium": "New York/New Jersey, United States",
+        "east rutherford": "New York/New Jersey, United States",
+        "new jersey": "New York/New Jersey, United States",
+        "new york": "New York/New Jersey, United States",
+        "lincoln financial field": "Philadelphia, United States",
+        "philadelphia": "Philadelphia, United States",
+        "levis stadium": "San Francisco Bay Area, United States",
+        "levi s stadium": "San Francisco Bay Area, United States",
+        "santa clara": "San Francisco Bay Area, United States",
+        "san francisco": "San Francisco Bay Area, United States",
+        "lumen field": "Seattle, United States",
+        "seattle": "Seattle, United States",
+        "estadio akron": "Guadalajara, Mexico",
+        "akron stadium": "Guadalajara, Mexico",
+        "guadalajara": "Guadalajara, Mexico",
+        "estadio azteca": "Mexico City, Mexico",
+        "azteca stadium": "Mexico City, Mexico",
+        "mexico city": "Mexico City, Mexico",
+        "ciudad de mexico": "Mexico City, Mexico",
+        "estadio bbva": "Monterrey, Mexico",
+        "bbva stadium": "Monterrey, Mexico",
+        "monterrey": "Monterrey, Mexico",
+        "bmo field": "Toronto, Canada",
+        "toronto": "Toronto, Canada",
+        "bc place": "Vancouver, Canada",
+        "vancouver": "Vancouver, Canada",
+    }
+
+    # Match exacto/contiene por alias.
+    for alias, key in aliases.items():
+        alias_norm = normalize_venue_text(alias)
+        if alias_norm and alias_norm in combined:
+            return key
+
+    # Match genérico contra los datos internos.
+    for key, v in WORLD_CUP_2026_VENUES.items():
+        candidates = [
+            key,
+            v.get("stadium", ""),
+            v.get("city", ""),
+            f'{v.get("city", "")} {v.get("country", "")}',
+        ]
+        for cand in candidates:
+            cn = normalize_venue_text(cand)
+            if cn and (cn in combined or combined in cn):
+                return key
+
+    return None
+
+
+def extract_venue_from_espn_scoreboard(data, team_a, team_b, match_date=None):
+    """Busca la sede/estadio en el scoreboard público de ESPN para el partido seleccionado."""
+    try:
+        if not data or not isinstance(data, dict):
+            return None
+
+        a = normalize_team_name(team_a)
+        b = normalize_team_name(team_b)
+        date_txt = str(match_date)[:10] if match_date is not None else ""
+
+        for ev in data.get("events", []):
+            comp = (ev.get("competitions") or [{}])[0]
+            competitors = comp.get("competitors", [])
+            if len(competitors) < 2:
+                continue
+
+            teams = []
+            for c in competitors:
+                teams.append(normalize_team_name((c.get("team") or {}).get("displayName") or (c.get("team") or {}).get("name")))
+            if {a, b} != set(teams):
+                continue
+
+            if date_txt:
+                ev_date = str(ev.get("date", ""))[:10]
+                if ev_date and ev_date != date_txt:
+                    # Diferencias de zona horaria pueden cambiar el día; no descartamos, pero seguimos buscando exacto.
+                    pass
+
+            venue = comp.get("venue") or ev.get("venue") or {}
+            venue_name = (
+                venue.get("fullName") or
+                venue.get("name") or
+                venue.get("displayName") or
+                ""
+            )
+            address = venue.get("address") or {}
+            venue_city = (
+                address.get("city") or
+                venue.get("city") or
+                venue.get("location") or
+                ""
+            )
+            key = match_venue_key_from_name_city(venue_name, venue_city)
+            if key:
+                return {
+                    "venue_key": key,
+                    "venue_name": venue_name,
+                    "venue_city": venue_city,
+                    "source": "ESPN público",
+                    "confidence": "Alta",
+                    "exact": True,
+                    "message": f"Sede detectada automáticamente desde ESPN: {venue_option_label(key)}"
+                }
+    except Exception:
+        pass
+
+    return None
+
+
+def fetch_public_venue_for_match(team_a, team_b, match_date=None, force=False):
+    """Obtiene sede desde fuentes públicas gratuitas cuando la API paga no está disponible."""
+    try:
+        data = fetch_espn_worldcup_scoreboard(match_date=match_date, force=force)
+        return extract_venue_from_espn_scoreboard(data, team_a, team_b, match_date=match_date)
+    except Exception:
+        return None
+
+
+def reference_venue_for_match(team_a, team_b, sede_pais="Sin ventaja de anfitrión", selected_venue_key=None):
+    """
+    Escoge una sede base profesional cuando el partido no está en calendario oficial
+    o no se encuentra estadio exacto en internet.
+    """
+    if selected_venue_key in WORLD_CUP_2026_VENUES:
+        key = selected_venue_key
+        return {
+            "venue_key": key,
+            "source": "Selección del usuario",
+            "confidence": "Manual",
+            "exact": False,
+            "message": f"Usando la sede seleccionada manualmente: {venue_option_label(key)}"
+        }
+
+    # Si el usuario indicó país anfitrión, usar una sede representativa del país.
+    by_country_default = {
+        "United States": "Atlanta, United States",
+        "Mexico": "Mexico City, Mexico",
+        "Canada": "Toronto, Canada",
+    }
+    if sede_pais in by_country_default:
+        key = by_country_default[sede_pais]
+        return {
+            "venue_key": key,
+            "source": "Referencia por país anfitrión",
+            "confidence": "Media",
+            "exact": False,
+            "message": f"No se encontró estadio exacto; usando referencia de {sede_pais}: {venue_option_label(key)}"
+        }
+
+    # Base neutral para comparaciones no oficiales.
+    key = "Atlanta, United States"
+    return {
+        "venue_key": key,
+        "source": "Referencia neutral",
+        "confidence": "Baja",
+        "exact": False,
+        "message": f"No es un partido oficial detectado o no hay sede exacta; usando sede base neutral: {venue_option_label(key)}"
+    }
+
+
+def resolve_worldcup_match_venue(api_key, team_a, team_b, sede_pais="Sin ventaja de anfitrión",
+                                 selected_venue_key=None, match_date=None, internal_fixture=None,
+                                 force=False, use_api=True, use_public=True):
+    """
+    Resuelve automáticamente el estadio/lugar del partido con jerarquía profesional:
+
+    1. Calendario interno si ya tiene venue_key exacto.
+    2. API-Football si devuelve venue name/city.
+    3. Scoreboard público ESPN si devuelve venue.
+    4. Sede seleccionada por usuario o referencia por país/base neutral.
+
+    Devuelve venue_key + metadata de fuente/confianza.
+    """
+    a = normalize_team_name(team_a)
+    b = normalize_team_name(team_b)
+
+    # 1) Calendario interno con venue_key.
+    try:
+        if internal_fixture is None:
+            internal_fixture = find_internal_fixture(a, b, match_date=match_date)
+        if internal_fixture and internal_fixture.get("venue_key") in WORLD_CUP_2026_VENUES:
+            key = internal_fixture["venue_key"]
+            return {
+                "venue_key": key,
+                "venue": WORLD_CUP_2026_VENUES[key],
+                "source": "Calendario interno exacto",
+                "confidence": "Alta",
+                "exact": True,
+                "fixture": internal_fixture,
+                "message": f"Sede exacta guardada en calendario interno: {venue_option_label(key)}"
+            }
+    except Exception:
+        pass
+
+    # 2) API-Football si hay clave y cobertura.
+    if api_key and use_api:
+        try:
+            fixtures_json = fetch_worldcup_fixtures(api_key, force=force)
+            api_fixture = find_fixture_for_match(fixtures_json, a, b, match_date=match_date)
+            if api_fixture:
+                key = match_venue_key_from_name_city(api_fixture.get("venue_name", ""), api_fixture.get("venue_city", ""))
+                if key:
+                    return {
+                        "venue_key": key,
+                        "venue": WORLD_CUP_2026_VENUES[key],
+                        "source": "API-Football",
+                        "confidence": "Alta",
+                        "exact": True,
+                        "fixture": api_fixture,
+                        "message": f"Sede detectada desde API-Football: {venue_option_label(key)}"
+                    }
+        except Exception:
+            pass
+
+    # 3) Fuente pública gratuita.
+    if use_public:
+        public_venue = fetch_public_venue_for_match(a, b, match_date=match_date, force=force)
+        if public_venue and public_venue.get("venue_key") in WORLD_CUP_2026_VENUES:
+            key = public_venue["venue_key"]
+            public_venue["venue"] = WORLD_CUP_2026_VENUES[key]
+            public_venue["fixture"] = internal_fixture
+            return public_venue
+
+    # 4) Fallback profesional.
+    fallback = reference_venue_for_match(a, b, sede_pais=sede_pais, selected_venue_key=selected_venue_key)
+    key = fallback["venue_key"]
+    fallback["venue"] = WORLD_CUP_2026_VENUES[key]
+    fallback["fixture"] = internal_fixture
+    return fallback
+
 
 
 def fetch_espn_worldcup_scoreboard(match_date=None, force=False):
@@ -3243,11 +3539,22 @@ def auto_fetch_advanced_context(api_key, team_a, team_b, sede_pais, venue_key, m
     """
     internal_fixture = find_internal_fixture(team_a, team_b, match_date=match_date)
 
-    # Si el calendario interno tiene sede exacta, la usamos. Si no, se respeta la sede elegida por el usuario.
-    if internal_fixture and internal_fixture.get("venue_key") in WORLD_CUP_2026_VENUES:
-        venue_key = internal_fixture["venue_key"]
-
-    venue = WORLD_CUP_2026_VENUES.get(venue_key, list(WORLD_CUP_2026_VENUES.values())[0])
+    # Resolver estadio automáticamente con jerarquía profesional:
+    # calendario exacto -> API-Football -> ESPN público -> selección manual/referencia.
+    venue_resolution = resolve_worldcup_match_venue(
+        api_key=api_key,
+        team_a=team_a,
+        team_b=team_b,
+        sede_pais=sede_pais,
+        selected_venue_key=venue_key,
+        match_date=match_date,
+        internal_fixture=internal_fixture,
+        force=force,
+        use_api=True,
+        use_public=True
+    )
+    venue_key = venue_resolution.get("venue_key", venue_key)
+    venue = venue_resolution.get("venue") or WORLD_CUP_2026_VENUES.get(venue_key, list(WORLD_CUP_2026_VENUES.values())[0])
     weather = fetch_open_meteo_weather(venue["lat"], venue["lon"], match_date=match_date)
 
     # Si calendario interno detecta sede_pais de anfitrión y el usuario dejó "sin ventaja", usamos la sede interna.
@@ -3310,6 +3617,12 @@ def auto_fetch_advanced_context(api_key, team_a, team_b, sede_pais, venue_key, m
         "temperature_c": weather["temperature_c"],
         "humidity_pct": weather["humidity_pct"],
         "altitude_m": float(venue["altitude_m"]),
+        "venue_key": venue_key,
+        "venue_stadium": venue.get("stadium", ""),
+        "venue_city": venue.get("city", ""),
+        "venue_country": venue.get("country", ""),
+        "venue_source": venue_resolution.get("source", ""),
+        "venue_confidence": venue_resolution.get("confidence", ""),
         "crowd_support_a": crowd_support_a,
         "crowd_support_b": crowd_support_b,
         "pressure_a": pressure_a,
@@ -3344,6 +3657,8 @@ def auto_fetch_advanced_context(api_key, team_a, team_b, sede_pais, venue_key, m
         "weather": weather,
         "venue": venue,
         "venue_key": venue_key,
+        "venue_resolution": venue_resolution,
+        "venue_message": venue_resolution.get("message", ""),
         "internal_fixture": internal_fixture,
         "news_a": news_a.get("message", ""),
         "news_b": news_b.get("message", ""),
@@ -6461,9 +6776,26 @@ def streamlit_app():
     detected_fixture = find_internal_fixture(team_a, team_b)
     venue_options = list(WORLD_CUP_2026_VENUES.keys())
 
-    if detected_fixture and detected_fixture.get("venue_key") in WORLD_CUP_2026_VENUES:
-        default_venue = detected_fixture["venue_key"]
-    else:
+    # Resolver sede predeterminada antes de mostrar el selector.
+    # Jerarquía: calendario exacto -> API/ESPN público -> referencia profesional.
+    detected_date_tmp = pd.to_datetime((detected_fixture or {}).get("date"), errors="coerce")
+    default_match_date_tmp = detected_date_tmp.date() if pd.notna(detected_date_tmp) else datetime.today().date()
+
+    pre_venue_resolution = resolve_worldcup_match_venue(
+        api_key=api_key,
+        team_a=team_a,
+        team_b=team_b,
+        sede_pais=sede_pais,
+        selected_venue_key=None,
+        match_date=default_match_date_tmp,
+        internal_fixture=detected_fixture,
+        force=False,
+        use_api=bool(api_key),
+        use_public=True
+    )
+
+    default_venue = pre_venue_resolution.get("venue_key")
+    if default_venue not in WORLD_CUP_2026_VENUES:
         detected_country = (detected_fixture or {}).get("sede_pais", sede_pais)
         default_venue = next(
             (v for v in venue_options if WORLD_CUP_2026_VENUES[v]["country"] == detected_country),
@@ -6485,10 +6817,22 @@ def streamlit_app():
 
         auto_col1, auto_col2, auto_col3 = st.columns([2, 1, 1])
         with auto_col1:
+            # Si cambia el partido, actualizamos automáticamente el estadio sugerido.
+            match_key_for_venue = f"{team_a}|{team_b}|{str(default_match_date_tmp)}|{sede_pais}"
+            if st.session_state.get("venue_match_key") != match_key_for_venue:
+                st.session_state["venue_match_key"] = match_key_for_venue
+                st.session_state["venue_auto_selected"] = default_venue
+
             venue_key = st.selectbox(
                 "Sede/estadio para clima y altitud",
                 venue_options,
-                index=venue_options.index(default_venue) if default_venue in venue_options else 0
+                index=venue_options.index(st.session_state.get("venue_auto_selected", default_venue)) if st.session_state.get("venue_auto_selected", default_venue) in venue_options else 0,
+                format_func=venue_option_label,
+                key="venue_auto_selected",
+                help=(
+                    "La app intenta detectar automáticamente el estadio por calendario interno, API-Football o ESPN público. "
+                    "Si no lo encuentra, usa una sede de referencia profesional y puedes cambiarla manualmente."
+                )
             )
         with auto_col2:
             detected_date = pd.to_datetime((detected_fixture or {}).get("date"), errors="coerce")
@@ -6508,11 +6852,19 @@ def streamlit_app():
                 )
             )
 
-        if detected_fixture and not detected_fixture.get("venue_key"):
-            st.info(
-                "El calendario interno detectó el partido, pero no tiene sede exacta guardada. "
-                "La app usará la sede seleccionada para clima/altitud. Puedes completar venue_key en "
-                "datos/calendario_mundial_2026.csv cuando tengas el estadio real."
+        if pre_venue_resolution:
+            msg = pre_venue_resolution.get("message", "")
+            conf = pre_venue_resolution.get("confidence", "")
+            src = pre_venue_resolution.get("source", "")
+            if pre_venue_resolution.get("exact"):
+                st.success(f"🏟️ {msg} · Fuente: {src} · Confianza: {conf}")
+            else:
+                st.info(f"🏟️ {msg} · Fuente: {src} · Confianza: {conf}")
+
+        if detected_fixture and not detected_fixture.get("venue_key") and not pre_venue_resolution.get("exact"):
+            st.caption(
+                "El calendario interno detectó el partido, pero no tenía sede exacta guardada. "
+                "La app intentó resolverla por internet; si no hay fuente exacta, usa una sede de referencia."
             )
 
         usar_auto_web = st.checkbox("Usar actualización automática desde internet", value=True)
@@ -6541,6 +6893,12 @@ def streamlit_app():
                 "temperature_c": 22,
                 "humidity_pct": 55,
                 "altitude_m": float(venue["altitude_m"]),
+                "venue_key": venue_key,
+                "venue_stadium": venue.get("stadium", ""),
+                "venue_city": venue.get("city", ""),
+                "venue_country": venue.get("country", ""),
+                "venue_source": "Selección manual",
+                "venue_confidence": "Manual",
                 "crowd_support_a": 8 if venue_info["host_adv_home"] == 1 else 4 if venue_info["host_adv_away"] == 1 else 5,
                 "crowd_support_b": 8 if venue_info["host_adv_away"] == 1 else 4 if venue_info["host_adv_home"] == 1 else 5,
                 "pressure_a": 3 if venue_info["host_adv_home"] == 1 else 7 if venue_info["host_adv_away"] == 1 else 5,
@@ -6601,6 +6959,9 @@ def streamlit_app():
 
         st.markdown("**Valores usados por el modelo**")
         values_df = pd.DataFrame([
+            {"Variable": "Estadio/sede", "Valor": advanced_context.get("venue_stadium") or venue_option_label(advanced_context.get("venue_key", venue_key))},
+            {"Variable": "Ciudad sede", "Valor": f'{advanced_context.get("venue_city", "")}, {advanced_context.get("venue_country", "")}'.strip(", ")},
+            {"Variable": "Fuente sede", "Valor": f'{advanced_context.get("venue_source", "")} · {advanced_context.get("venue_confidence", "")}'.strip(" · ")},
             {"Variable": "Temperatura (°C)", "Valor": advanced_context["temperature_c"]},
             {"Variable": "Humedad (%)", "Valor": advanced_context["humidity_pct"]},
             {"Variable": "Altitud (m)", "Valor": advanced_context["altitude_m"]},
@@ -6622,6 +6983,7 @@ def streamlit_app():
 
         st.markdown("**Fuentes y diagnóstico de actualización**")
         diag_df = pd.DataFrame([
+            {"Fuente": "Sede/estadio", "Detalle": auto_sources.get("venue_message", "") or str(auto_sources.get("venue_resolution", ""))},
             {"Fuente": "Clima", "Detalle": auto_sources.get("weather", {}).get("message", "")},
             {"Fuente": f"Noticias {team_a}", "Detalle": auto_sources.get("news_a", "")},
             {"Fuente": f"Noticias {team_b}", "Detalle": auto_sources.get("news_b", "")},
