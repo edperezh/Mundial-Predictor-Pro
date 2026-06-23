@@ -115,7 +115,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V28_PRECISION_DESDE_TUNEZ_JAPON"
+MODEL_VERSION = "V29_PRODUCCION_INFERENCIA"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -5896,12 +5896,75 @@ def get_fixed_api_key():
     return ""
 
 
-def enforce_access_gate():
+
+# ============================================================
+# 10D. MODO ADMIN / PRODUCCIÓN
+# ============================================================
+
+def get_admin_code():
+    """Código privado para abrir herramientas administrativas."""
+    return str(get_config_value("APP_ADMIN_CODE", "") or "").strip()
+
+
+def render_admin_login(lang="es"):
+    """
+    Panel pequeño en barra lateral.
+    En modo público NO muestra reentrenamiento ni claves internas.
+    """
+    admin_code = get_admin_code()
+    if st.session_state.get("admin_mode", False):
+        with st.sidebar.expander("🔐 Administrador", expanded=False):
+            st.success("Modo administrador activo")
+            if st.button("Cerrar modo admin", use_container_width=True):
+                st.session_state["admin_mode"] = False
+                try:
+                    st.rerun()
+                except Exception:
+                    pass
+        return True
+
+    with st.sidebar.expander("🔐 Administrador", expanded=False):
+        if not admin_code:
+            st.caption("Configura APP_ADMIN_CODE en Secrets para administrar la app.")
+            return False
+        typed = st.text_input("Código admin", type="password", key="admin_code_input")
+        if st.button("Entrar como admin", use_container_width=True, key="admin_login_btn"):
+            if typed and typed.strip() == admin_code:
+                st.session_state["admin_mode"] = True
+                st.success("Administrador activo")
+                try:
+                    st.rerun()
+                except Exception:
+                    pass
+            else:
+                st.error("Código incorrecto")
+    return False
+
+
+def hydrate_session_from_artifact(min_year=None, status_prefix="Modelo estable cargado automáticamente"):
+    """Carga modelo guardado en session_state si existe."""
+    artifact = load_stable_artifact()
+    if not artifact:
+        return False
+    st.session_state.training_result = artifact.get("training_result")
+    st.session_state.results = artifact.get("results")
+    st.session_state.mem = artifact.get("mem")
+    meta = artifact.get("metadata", {}) or {}
+    st.session_state.api_status = f"{status_prefix}: {meta.get('model_version', MODEL_VERSION)}."
+    st.session_state.min_year = meta.get("min_year", min_year)
+    st.session_state.model_metadata = meta
+    return True
+
+
+def enforce_access_gate(is_admin=False):
     """
     Bloquea la app si APP_REQUIRE_ACCESS=true y no hay código válido.
-    Si no hay paywall configurado, deja pasar para pruebas.
+    El administrador puede entrar aunque el paywall esté activo.
     """
     settings = monetization_settings()
+
+    if is_admin:
+        return settings
 
     if not settings["require_access"]:
         return settings
@@ -5968,54 +6031,67 @@ def streamlit_app():
 
     st.caption(tr("caption", lang))
 
-    access_settings = enforce_access_gate()
+    admin_mode = render_admin_login(lang)
+    access_settings = enforce_access_gate(is_admin=admin_mode)
 
     current_year = datetime.today().year
     default_min_year = max(1980, current_year - 8)
 
+    # Configuración interna: solo administrador. En modo público la app solo hace inferencia.
+    fixed_api_key = get_fixed_api_key()
+    api_key = fixed_api_key
+    force_update = False
+    min_year = default_min_year
+    ejecutar = False
+    cargar_guardado = False
+
     with st.sidebar:
         st.header(tr("settings", lang))
-
-        fixed_api_key = get_fixed_api_key()
         if fixed_api_key:
-            api_key = fixed_api_key
             st.success("🔐 " + tr("api_fixed", lang))
         else:
-            api_key = st.text_input(
-                tr("api_optional", lang),
-                value="",
-                type="password",
-                help=tr("api_help", lang)
+            st.info("API no configurada en Secrets. La app usará datos guardados/manuales.")
+
+        if admin_mode:
+            st.markdown("### 🛠️ Panel interno")
+            if not fixed_api_key:
+                api_key = st.text_input(
+                    tr("api_optional", lang),
+                    value="",
+                    type="password",
+                    help=tr("api_help", lang)
+                )
+            force_update = st.checkbox(tr("force_update", lang), value=False)
+            min_year = st.slider(
+                tr("min_year", lang),
+                min_value=1980,
+                max_value=max(2026, current_year),
+                value=default_min_year,
+                help="Por defecto usa los últimos 8 años para que cargue más rápido y sea más relevante."
             )
-
-        force_update = st.checkbox(tr("force_update", lang), value=False)
-
-        min_year = st.slider(
-            tr("min_year", lang),
-            min_value=1980,
-            max_value=max(2026, current_year),
-            value=default_min_year,
-            help="Por defecto usa los últimos 8 años para que cargue más rápido y sea más relevante."
-        )
-
-        st.info(tr("manual_info", lang))
+            st.info(tr("manual_info", lang))
+        else:
+            st.caption("Modo público: las predicciones usan el modelo oficial guardado. No reentrena ni muestra claves internas.")
 
         st.markdown("---")
         st.markdown(f"**{tr('author', lang)}:** Eder R Perez Herrera")
 
-    st.markdown("### " + tr("execution_panel", lang))
-    st.write(tr("execution_text", lang))
+    if admin_mode:
+        st.markdown("### " + tr("execution_panel", lang))
+        st.write("Modo administrador: aquí puedes actualizar datos, reentrenar y guardar una nueva versión del modelo.")
 
-    c_run, c_load = st.columns([3, 1])
-    with c_run:
-        ejecutar = st.button(tr("retrain", lang), type="primary", use_container_width=True)
-    with c_load:
-        cargar_guardado = st.button(
-            tr("load_saved", lang),
-            use_container_width=True,
-            disabled=not MODEL_ARTIFACT_PATH.exists(),
-            help="Carga modelos/modelo_oficial.pkl si existe."
-        )
+        c_run, c_load = st.columns([3, 1])
+        with c_run:
+            ejecutar = st.button(tr("retrain", lang), type="primary", use_container_width=True)
+        with c_load:
+            cargar_guardado = st.button(
+                tr("load_saved", lang),
+                use_container_width=True,
+                disabled=not MODEL_ARTIFACT_PATH.exists(),
+                help="Carga modelos/modelo_oficial.pkl si existe."
+            )
+    else:
+        st.info("🔒 Modo público activo: la app usa el modelo oficial guardado y solo ejecuta predicciones, sin reentrenar.")
 
     if "training_result" not in st.session_state:
         st.session_state.training_result = None
@@ -6023,6 +6099,11 @@ def streamlit_app():
         st.session_state.mem = None
         st.session_state.api_status = None
         st.session_state.min_year = None
+        st.session_state.model_metadata = None
+
+    # En producción: cargar automáticamente el modelo guardado al entrar.
+    if st.session_state.training_result is None and MODEL_ARTIFACT_PATH.exists():
+        hydrate_session_from_artifact(min_year=min_year)
 
     if cargar_guardado:
         artifact = load_stable_artifact()
@@ -6149,7 +6230,12 @@ def streamlit_app():
             return
 
     if st.session_state.training_result is None:
-        st.warning("Presiona **🚀 Ejecutar análisis y entrenar modelos** para cargar la información.")
+        if admin_mode:
+            st.warning("Aún no hay modelo oficial guardado. Reentrena una vez como administrador para crear `modelos/modelo_oficial.pkl`.")
+        else:
+            st.warning(
+                "El modelo oficial todavía no está disponible. El administrador debe entrenarlo una vez y guardar la versión de producción."
+            )
         st.stop()
 
     training_result = st.session_state.training_result
@@ -6157,7 +6243,10 @@ def streamlit_app():
     mem = st.session_state.mem
     api_status = st.session_state.api_status
 
-    st.success(api_status)
+    if admin_mode:
+        st.success(api_status)
+    else:
+        st.success("✅ Modelo oficial cargado. Predicciones públicas en modo inferencia, sin reentrenamiento.")
 
     colA, colB, colC, colD, colE, colF = st.columns(6)
     colA.metric("Partidos cargados", f"{len(results):,}")
@@ -6440,16 +6529,23 @@ def streamlit_app():
 
     st.divider()
 
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        tr("tabs_champion", lang),
-        tr("tabs_map", lang),
-        tr("tabs_precision", lang),
-        tr("tabs_models", lang),
-        tr("tabs_confusion", lang),
-        tr("tabs_corr", lang),
-        tr("tabs_importance", lang),
-        tr("tabs_match_data", lang)
-    ])
+    if admin_mode:
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+            tr("tabs_champion", lang),
+            tr("tabs_map", lang),
+            tr("tabs_precision", lang),
+            tr("tabs_models", lang),
+            tr("tabs_confusion", lang),
+            tr("tabs_corr", lang),
+            tr("tabs_importance", lang),
+            tr("tabs_match_data", lang)
+        ])
+    else:
+        tab0, tab1, tab2 = st.tabs([
+            tr("tabs_champion", lang),
+            tr("tabs_map", lang),
+            tr("tabs_precision", lang)
+        ])
 
     with tab0:
         st.subheader("Probabilidad estimada de ganar el Mundial")
@@ -6619,96 +6715,103 @@ def streamlit_app():
                 f"en ganador/empate/perdedor. El marcador exacto es más difícil, por eso se mide también si cayó dentro del top 3."
             )
 
-    with tab3:
-        st.subheader("Comparación de modelos")
+    if admin_mode:
+        with tab3:
+            st.subheader("Comparación de modelos")
 
-        st.markdown("### Modo producción estable")
-        meta_df = pd.DataFrame([
-            {"Campo": "Modelo oficial usado en predicciones", "Valor": training_result.get("official_model_name", "")},
-            {"Campo": "Mejor modelo en validación", "Valor": training_result.get("best_name", "")},
-            {"Campo": "Versión del modelo", "Valor": training_result.get("model_version", MODEL_VERSION)},
-            {"Campo": "Creado / reentrenado", "Valor": training_result.get("model_created_at", "")},
-            {"Campo": "Train temporal", "Valor": f"{training_result.get('train_start', '')} → {training_result.get('train_end', '')}"},
-            {"Campo": "Test temporal", "Valor": f"{training_result.get('test_start', '')} → {training_result.get('test_end', '')}"},
-            {"Campo": "Estabilidad promedio", "Valor": f"{training_result.get('stability_summary', {}).get('label', 'Media')} ({training_result.get('stability_summary', {}).get('variation_pct', 0)}% var.)"},
-            {"Campo": "Archivo modelo", "Valor": str(MODEL_ARTIFACT_PATH)},
-            {"Campo": "Snapshot Mundial", "Valor": str(WC_SNAPSHOT_FILE)},
-        ])
-        st.dataframe(safe_streamlit_df(meta_df), use_container_width=True, hide_index=True)
+            st.markdown("### Modo producción estable")
+            meta_df = pd.DataFrame([
+                {"Campo": "Modelo oficial usado en predicciones", "Valor": training_result.get("official_model_name", "")},
+                {"Campo": "Mejor modelo en validación", "Valor": training_result.get("best_name", "")},
+                {"Campo": "Versión del modelo", "Valor": training_result.get("model_version", MODEL_VERSION)},
+                {"Campo": "Creado / reentrenado", "Valor": training_result.get("model_created_at", "")},
+                {"Campo": "Train temporal", "Valor": f"{training_result.get('train_start', '')} → {training_result.get('train_end', '')}"},
+                {"Campo": "Test temporal", "Valor": f"{training_result.get('test_start', '')} → {training_result.get('test_end', '')}"},
+                {"Campo": "Estabilidad promedio", "Valor": f"{training_result.get('stability_summary', {}).get('label', 'Media')} ({training_result.get('stability_summary', {}).get('variation_pct', 0)}% var.)"},
+                {"Campo": "Archivo modelo", "Valor": str(MODEL_ARTIFACT_PATH)},
+                {"Campo": "Snapshot Mundial", "Valor": str(WC_SNAPSHOT_FILE)},
+            ])
+            st.dataframe(safe_streamlit_df(meta_df), use_container_width=True, hide_index=True)
 
-        metrics = training_result["metrics"].copy()
-        for col in ["accuracy", "f1_weighted", "log_loss", "brier_score"]:
-            if col in metrics.columns:
-                metrics[col] = metrics[col].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
-        st.dataframe(safe_streamlit_df(metrics.sort_values(["log_loss", "brier_score", "f1_weighted"], ascending=[True, True, False])), use_container_width=True)
+            metrics = training_result["metrics"].copy()
+            for col in ["accuracy", "f1_weighted", "log_loss", "brier_score"]:
+                if col in metrics.columns:
+                    metrics[col] = metrics[col].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
+            st.dataframe(safe_streamlit_df(metrics.sort_values(["log_loss", "brier_score", "f1_weighted"], ascending=[True, True, False])), use_container_width=True)
 
-        st.markdown("""
-        **Lectura rápida:**
-        - `accuracy`: porcentaje de aciertos en ganador/empate/perdedor.
-        - `f1_weighted`: equilibrio entre precisión y sensibilidad para las tres clases.
-        - `log_loss`: castiga probabilidades mal calibradas. Mientras más bajo, mejor.
-        - `brier_score`: mide calidad/calibración de probabilidades. Mientras más bajo, mejor.
-        """)
+            st.markdown("""
+            **Lectura rápida:**
+            - `accuracy`: porcentaje de aciertos en ganador/empate/perdedor.
+            - `f1_weighted`: equilibrio entre precisión y sensibilidad para las tres clases.
+            - `log_loss`: castiga probabilidades mal calibradas. Mientras más bajo, mejor.
+            - `brier_score`: mide calidad/calibración de probabilidades. Mientras más bajo, mejor.
+            """)
 
-        st.subheader("Modelos de goles esperados")
-        goal_metrics = training_result.get("goal_metrics")
-        if goal_metrics is not None:
-            gm = goal_metrics.copy()
-            for col in ["mae_home", "mae_away", "mae_promedio"]:
-                if col in gm.columns:
-                    gm[col] = gm[col].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
-            st.dataframe(safe_streamlit_df(gm.sort_values("mae_promedio")), use_container_width=True)
-            st.caption(f'Mejor modelo de goles: {training_result.get("goal_best_name")}')
+            st.subheader("Modelos de goles esperados")
+            goal_metrics = training_result.get("goal_metrics")
+            if goal_metrics is not None:
+                gm = goal_metrics.copy()
+                for col in ["mae_home", "mae_away", "mae_promedio"]:
+                    if col in gm.columns:
+                        gm[col] = gm[col].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
+                st.dataframe(safe_streamlit_df(gm.sort_values("mae_promedio")), use_container_width=True)
+                st.caption(f'Mejor modelo de goles: {training_result.get("goal_best_name")}')
 
-        st.subheader("Backtesting Mundial 2018 / 2022")
-        st.caption(
-            "Esta prueba reconstruye una base histórica desde 2010. "
-            "No depende del slider principal 'Usar partidos desde el año'."
-        )
-        if st.button("Ejecutar backtesting histórico", use_container_width=True):
-            with st.spinner("Ejecutando backtesting..."):
-                bt = backtest_world_cups(min_year_backtest=2010)
-            st.session_state["backtest_df"] = bt
-
-        if "backtest_df" in st.session_state:
-            bt = st.session_state["backtest_df"].copy()
-            for col in ["accuracy", "log_loss", "brier_score"]:
-                if col in bt.columns:
-                    bt[col] = bt[col].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
-            st.dataframe(safe_streamlit_df(bt), use_container_width=True, hide_index=True)
+            st.subheader("Backtesting Mundial 2018 / 2022")
             st.caption(
-                "Backtesting mejorado: ahora evalúa solo partidos exactos con tournament = World Cup "
-                "y escoge el mejor modelo con validación temporal antes de probar cada Mundial."
+                "Esta prueba reconstruye una base histórica desde 2010. "
+                "No depende del slider principal 'Usar partidos desde el año'."
             )
+            if st.button("Ejecutar backtesting histórico", use_container_width=True):
+                with st.spinner("Ejecutando backtesting..."):
+                    bt = backtest_world_cups(min_year_backtest=2010)
+                st.session_state["backtest_df"] = bt
 
-    with tab4:
-        fig = plot_confusion_matrix(training_result)
-        st.pyplot(fig, clear_figure=True)
+            if "backtest_df" in st.session_state:
+                bt = st.session_state["backtest_df"].copy()
+                for col in ["accuracy", "log_loss", "brier_score"]:
+                    if col in bt.columns:
+                        bt[col] = bt[col].map(lambda x: round(float(x), 4) if pd.notna(x) else x)
+                st.dataframe(safe_streamlit_df(bt), use_container_width=True, hide_index=True)
+                st.caption(
+                    "Backtesting mejorado: ahora evalúa solo partidos exactos con tournament = World Cup "
+                    "y escoge el mejor modelo con validación temporal antes de probar cada Mundial."
+                )
 
-    with tab5:
-        fig = plot_correlation(training_result["features_df"], training_result["feature_cols"])
-        st.pyplot(fig, clear_figure=True)
+        with tab4:
+            fig = plot_confusion_matrix(training_result)
+            st.pyplot(fig, clear_figure=True)
 
-    with tab6:
-        fig = plot_feature_importance(training_result, top_n=18)
-        st.pyplot(fig, clear_figure=True)
+        with tab5:
+            fig = plot_correlation(training_result["features_df"], training_result["feature_cols"])
+            st.pyplot(fig, clear_figure=True)
 
-        imp = get_feature_importance(training_result).head(25)
-        imp_show = imp[["variable", "peso_%"]].copy()
-        imp_show["peso_%"] = imp_show["peso_%"].map(lambda x: f"{x:.2f}%")
-        st.dataframe(safe_streamlit_df(imp_show), use_container_width=True, hide_index=True)
+        with tab6:
+            fig = plot_feature_importance(training_result, top_n=18)
+            st.pyplot(fig, clear_figure=True)
 
-    with tab7:
-        st.subheader("Variables usadas para este partido")
-        ff = prediction["future_features"].T.reset_index()
-        ff.columns = ["Variable", "Valor"]
-        st.dataframe(safe_streamlit_df(ff), use_container_width=True, hide_index=True)
+            imp = get_feature_importance(training_result).head(25)
+            imp_show = imp[["variable", "peso_%"]].copy()
+            imp_show["peso_%"] = imp_show["peso_%"].map(lambda x: f"{x:.2f}%")
+            st.dataframe(safe_streamlit_df(imp_show), use_container_width=True, hide_index=True)
+
+        with tab7:
+            st.subheader("Variables usadas para este partido")
+            ff = prediction["future_features"].T.reset_index()
+            ff.columns = ["Variable", "Valor"]
+            st.dataframe(safe_streamlit_df(ff), use_container_width=True, hide_index=True)
 
     st.divider()
-    st.caption(
-        "Consejo: después de cada jornada, actualiza datos/mundial_2026_manual.csv o usa la API "
-        "y vuelve a ejecutar. El modelo se alimenta con la información nueva."
-    )
+    if admin_mode:
+        st.caption(
+            "Consejo admin: después de una jornada nueva, actualiza datos/API y reentrena controladamente. "
+            "Los usuarios públicos seguirán usando el modelo oficial guardado."
+        )
+    else:
+        st.caption(
+            "Modo público: las cifras provienen del modelo oficial guardado. "
+            "Las probabilidades son estimaciones educativas, no garantías de resultado."
+        )
 
 
 # ============================================================
