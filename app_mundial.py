@@ -115,7 +115,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V29_PRODUCCION_INFERENCIA"
+MODEL_VERSION = "V30_MARCADORES_TOP3"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -3791,6 +3791,170 @@ def blend_poisson_with_ml(score_df, ml_probs, alpha=0.48):
     return df
 
 
+COMMON_SCORE_PRIOR = {
+    # Priors suaves: no reemplazan al modelo, solo corrigen la tendencia de Poisson
+    # a sobre/infra-representar ciertos marcadores mundialistas.
+    "1-0": 1.15, "0-1": 1.12,
+    "2-0": 1.10, "0-2": 1.07,
+    "2-1": 1.16, "1-2": 1.12,
+    "1-1": 1.03, "0-0": 0.98,
+    "3-0": 1.02, "0-3": 0.98,
+    "3-1": 1.04, "1-3": 1.00,
+    "2-2": 0.94,
+    "3-2": 0.92, "2-3": 0.90,
+    "4-0": 0.92, "0-4": 0.88,
+    "4-1": 0.88, "1-4": 0.84,
+}
+
+
+def calibrate_score_probabilities(score_df, lam_a, lam_b, probs=None, row=None):
+    """
+    Capa de calibración de marcadores.
+    Objetivo: mejorar el TOP 3 de marcadores, no solo el marcador #1.
+
+    Qué corrige:
+    - evita que 1-1 aparezca demasiado como top si hay favorito claro,
+    - da algo más de peso a marcadores históricamente frecuentes,
+    - favorece marcadores cercanos a los goles esperados,
+    - penaliza goleadas extremas salvo cuando el lambda lo justifica.
+    """
+    df = score_df.copy()
+
+    lam_a = float(lam_a)
+    lam_b = float(lam_b)
+    total_lam = lam_a + lam_b
+    lambda_diff = abs(lam_a - lam_b)
+
+    if probs is None:
+        outcome_probs = df.groupby("outcome")["prob_final"].sum().reindex([0, 1, 2], fill_value=0.0).to_numpy()
+    else:
+        outcome_probs = np.asarray([
+            probs.get("victoria_A", 0.0),
+            probs.get("empate", 0.0),
+            probs.get("victoria_B", 0.0),
+        ], dtype=float)
+        outcome_probs = np.clip(outcome_probs, 1e-6, 1.0)
+        outcome_probs = outcome_probs / outcome_probs.sum()
+
+    fav_strength = float(np.max(outcome_probs))
+    top_outcome = int(np.argmax(outcome_probs))
+
+    # Factor por marcador común.
+    df["score_prior"] = df["marcador"].map(COMMON_SCORE_PRIOR).fillna(0.80)
+
+    # Cercanía a lambdas de goles esperados.
+    df["lambda_distance"] = (
+        (df["goles_A"].astype(float) - lam_a) ** 2 +
+        (df["goles_B"].astype(float) - lam_b) ** 2
+    )
+    df["lambda_factor"] = np.exp(-0.16 * df["lambda_distance"])
+
+    # Penaliza extremos cuando el partido no se proyecta tan alto.
+    total_goals = df["goles_A"].astype(float) + df["goles_B"].astype(float)
+    extreme_penalty = np.ones(len(df), dtype=float)
+    extreme_penalty = np.where((total_goals >= 6) & (total_lam < 3.2), 0.58, extreme_penalty)
+    extreme_penalty = np.where((total_goals >= 5) & (total_lam < 2.6), 0.68, extreme_penalty)
+    extreme_penalty = np.where((total_goals <= 1) & (total_lam > 3.0), 0.78, extreme_penalty)
+    df["extreme_factor"] = extreme_penalty
+
+    # Ajuste de empates: 1-1/0-0 solo deben dominar si el partido es de verdad cerrado.
+    close_index = clamp(1.0 - lambda_diff / 1.25, 0.0, 1.0)
+    draw_cap_factor = 1.0
+    if fav_strength > 0.58:
+        draw_cap_factor *= 0.92
+    if fav_strength > 0.68:
+        draw_cap_factor *= 0.84
+    if lambda_diff > 0.65:
+        draw_cap_factor *= 0.86
+
+    is_draw = df["outcome"].astype(int) == 1
+    draw_factor = np.ones(len(df), dtype=float)
+    draw_factor = np.where(is_draw, clamp(0.84 + 0.24 * close_index, 0.78, 1.08) * draw_cap_factor, draw_factor)
+
+    # Si hay claro favorito, pequeños marcadores del favorito deben estar mejor representados.
+    fav_factor = np.ones(len(df), dtype=float)
+    if fav_strength >= 0.50:
+        fav_factor = np.where(df["outcome"].astype(int) == top_outcome, 1.0 + 0.10 * (fav_strength - 0.50) / 0.50, fav_factor)
+
+    df["prob_score_calibrated"] = (
+        df["prob_final"].astype(float)
+        * df["score_prior"].astype(float)
+        * df["lambda_factor"].astype(float)
+        * df["extreme_factor"].astype(float)
+        * draw_factor
+        * fav_factor
+    )
+
+    df["prob_score_calibrated"] = np.clip(df["prob_score_calibrated"], 1e-12, None)
+    df["prob_score_calibrated"] = df["prob_score_calibrated"] / df["prob_score_calibrated"].sum()
+    return df
+
+
+def select_top_scores_for_top3(score_df, lam_a, lam_b, probs=None, n=10):
+    """
+    Ordena marcadores pensando en mejorar cobertura TOP 3.
+    En fútbol el marcador exacto es muy difícil; para TOP 3 conviene que los tres
+    primeros no sean tres variantes casi iguales del mismo escenario.
+    """
+    df = calibrate_score_probabilities(score_df, lam_a, lam_b, probs=probs).copy()
+
+    outcome_probs = df.groupby("outcome")["prob_final"].sum().reindex([0, 1, 2], fill_value=0.0)
+    outcome_order = outcome_probs.sort_values(ascending=False).index.astype(int).tolist()
+    max_outcome_prob = float(outcome_probs.max()) if len(outcome_probs) else 0.0
+
+    # Ranking interno por probabilidad calibrada.
+    df = df.sort_values("prob_score_calibrated", ascending=False).reset_index(drop=True)
+
+    selected_idx = []
+    selected_scores = set()
+
+    def add_best_for_outcome(outcome):
+        subset = df[(df["outcome"].astype(int) == int(outcome)) & (~df["marcador"].isin(selected_scores))]
+        if subset.empty:
+            return False
+        idx = subset.index[0]
+        selected_idx.append(idx)
+        selected_scores.add(str(df.loc[idx, "marcador"]))
+        return True
+
+    # Patrón de cobertura para TOP 3.
+    # Si hay favorito muy claro: dos marcadores del favorito + uno alternativo.
+    # Si es cerrado: uno de cada escenario principal.
+    if max_outcome_prob >= 0.64:
+        pattern = [outcome_order[0], outcome_order[0], outcome_order[1]]
+    elif max_outcome_prob >= 0.52:
+        pattern = [outcome_order[0], outcome_order[1], outcome_order[0]]
+    else:
+        pattern = outcome_order[:3]
+
+    for outcome in pattern:
+        add_best_for_outcome(outcome)
+
+    # Completar top 3 si faltó alguno.
+    for _, r in df.iterrows():
+        if len(selected_idx) >= 3:
+            break
+        marcador = str(r["marcador"])
+        if marcador not in selected_scores:
+            selected_idx.append(r.name)
+            selected_scores.add(marcador)
+
+    # Completar el resto del top n por probabilidad calibrada.
+    for _, r in df.iterrows():
+        if len(selected_idx) >= n:
+            break
+        marcador = str(r["marcador"])
+        if marcador not in selected_scores:
+            selected_idx.append(r.name)
+            selected_scores.add(marcador)
+
+    out = df.loc[selected_idx].copy().reset_index(drop=True)
+    out["prob_ranking"] = out["prob_score_calibrated"]
+    out["probabilidad_%"] = out["prob_ranking"] * 100
+    out["ranking_top3"] = np.arange(1, len(out) + 1)
+    return out
+
+
 def predict_match(training_result, mem, history_df, team_a, team_b, neutral=True, sede_pais="Sin ventaja de anfitrión", advanced_context=None):
     """
     Devuelve:
@@ -3848,8 +4012,8 @@ def predict_match(training_result, mem, history_df, team_a, team_b, neutral=True
         "victoria_B": float(ml_probs[2]),
     }
 
-    top_scores = score_df.sort_values("prob_final", ascending=False).head(10).copy()
-    top_scores["probabilidad_%"] = top_scores["prob_final"] * 100
+    # Ranking de marcadores calibrado para mejorar cobertura del TOP 3.
+    top_scores = select_top_scores_for_top3(score_df, lam_a, lam_b, probs=probs, n=10)
 
     return {
         "team_a": team_a,
@@ -5126,7 +5290,6 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
         return pd.DataFrame(), {
             "partidos_evaluados": 0,
             "acierto_1x2_%": 0.0,
-            "acierto_marcador_top1_%": 0.0,
             "acierto_marcador_top3_%": 0.0,
             "aciertos_1x2": 0,
             "precision_start": precision_start_dt.date().isoformat() if pd.notna(precision_start_dt) else PRECISION_START_DATE,
@@ -5174,8 +5337,8 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
             actual_outcome = actual_outcome_from_score(hs, aw)
 
             top_scores = pred["top_scores"].copy()
-            top1 = str(top_scores.iloc[0]["marcador"]) if not top_scores.empty else ""
-            top3 = set(top_scores.head(3)["marcador"].astype(str).tolist())
+            top3_list = top_scores.head(3)["marcador"].astype(str).tolist() if not top_scores.empty else []
+            top3 = set(top3_list)
             actual_score = f"{hs}-{aw}"
 
             rows.append({
@@ -5185,8 +5348,7 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
                 "Predicción 1X2": outcome_text(pred_outcome, TEAM_NAME_ES.get(h,h), TEAM_NAME_ES.get(a,a)),
                 "Resultado real": outcome_text(actual_outcome, TEAM_NAME_ES.get(h,h), TEAM_NAME_ES.get(a,a)),
                 "Acierto 1X2": pred_outcome == actual_outcome,
-                "Top marcador": top1,
-                "Acierto marcador top1": top1 == actual_score,
+                "Top 3 marcadores": ", ".join(top3_list),
                 "Acierto marcador top3": actual_score in top3,
                 "Prob. A": probs["victoria_A"] * 100,
                 "Prob. Empate": probs["empate"] * 100,
@@ -5200,8 +5362,7 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
                 "Predicción 1X2": "Error",
                 "Resultado real": "",
                 "Acierto 1X2": False,
-                "Top marcador": "",
-                "Acierto marcador top1": False,
+                "Top 3 marcadores": "",
                 "Acierto marcador top3": False,
                 "Error": str(e)[:100],
             })
@@ -5213,7 +5374,6 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
     summary = {
         "partidos_evaluados": len(acc_df),
         "acierto_1x2_%": float(acc_df["Acierto 1X2"].mean() * 100),
-        "acierto_marcador_top1_%": float(acc_df["Acierto marcador top1"].mean() * 100),
         "acierto_marcador_top3_%": float(acc_df["Acierto marcador top3"].mean() * 100),
         "aciertos_1x2": int(acc_df["Acierto 1X2"].sum()),
         "precision_start": precision_start_dt.date().isoformat() if pd.notna(precision_start_dt) else PRECISION_START_DATE,
@@ -6693,18 +6853,17 @@ def streamlit_app():
         elif acc_summary.get("partidos_evaluados", 0) == 0:
             st.warning(acc_summary.get("mensaje", "Aún no hay partidos completados desde el inicio definido."))
         else:
-            p1, p2, p3, p4 = st.columns(4)
+            p1, p2, p3 = st.columns(3)
             p1.metric("Partidos evaluados", acc_summary["partidos_evaluados"])
             p2.metric("Acierto ganador/empate", f'{acc_summary["acierto_1x2_%"]:.1f}%')
-            p3.metric("Marcador exacto top 1", f'{acc_summary["acierto_marcador_top1_%"]:.1f}%')
-            p4.metric("Marcador en top 3", f'{acc_summary["acierto_marcador_top3_%"]:.1f}%')
+            p3.metric("Marcador en top 3", f'{acc_summary["acierto_marcador_top3_%"]:.1f}%')
 
             st.markdown("### Historial de predicciones evaluadas")
             show_acc = acc_df.copy()
             for col in ["Prob. A", "Prob. Empate", "Prob. B"]:
                 if col in show_acc.columns:
                     show_acc[col] = show_acc[col].map(lambda x: f"{float(x):.1f}%" if pd.notna(x) else "")
-            for col in ["Acierto 1X2", "Acierto marcador top1", "Acierto marcador top3"]:
+            for col in ["Acierto 1X2", "Acierto marcador top3"]:
                 if col in show_acc.columns:
                     show_acc[col] = show_acc[col].map(lambda x: "✅" if bool(x) else "❌")
             st.dataframe(safe_streamlit_df(show_acc), use_container_width=True, hide_index=True)
@@ -6712,7 +6871,8 @@ def streamlit_app():
             st.markdown("### Lectura rápida")
             st.write(
                 f"El modelo lleva **{acc_summary['aciertos_1x2']} aciertos de {acc_summary['partidos_evaluados']}** "
-                f"en ganador/empate/perdedor. El marcador exacto es más difícil, por eso se mide también si cayó dentro del top 3."
+                f"en ganador/empate/perdedor. Para marcador exacto se evalúa el **top 3 calibrado**, "
+                "porque es una métrica más útil y realista que exigir solo el marcador #1."
             )
 
     if admin_mode:
