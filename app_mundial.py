@@ -115,7 +115,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V27_CONTEO_AUTOMATICO"
+MODEL_VERSION = "V28_PRECISION_DESDE_TUNEZ_JAPON"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -134,7 +134,7 @@ WC_SNAPSHOT_FILE = DATA_DIR / "snapshot_mundial_2026.csv"
 # El usuario pidió iniciar desde Japan vs Tunisia/Tunisia vs Japan.
 PRECISION_START_FIXTURE_ID = 66456974
 PRECISION_START_TEAMS = {"Japan", "Tunisia"}
-PRECISION_START_LABEL = "Japan vs Tunisia"
+PRECISION_START_LABEL = "Túnez vs Japón"
 PRECISION_START_DATE = "2026-06-21"
 DEFAULT_MANUAL_FIXTURE_ID = "236"
 
@@ -5025,6 +5025,58 @@ def get_precision_start_datetime():
     return pd.to_datetime(PRECISION_START_DATE)
 
 
+
+def precision_pair_key(team_a, team_b):
+    """Clave independiente de local/visitante para comparar partidos."""
+    a = normalize_team_name(team_a)
+    b = normalize_team_name(team_b)
+    return "||".join(sorted([a, b]))
+
+
+def get_precision_allowed_match_keys():
+    """
+    Devuelve el conjunto de partidos que deben contarse en la pestaña Precisión.
+
+    Problema corregido:
+    Filtrar solo por fecha incluía partidos anteriores a Túnez vs Japón cuando caían en la
+    misma fecha local/UTC. Ahora se usa el orden real del calendario interno y se cuenta
+    desde el fixture de Túnez vs Japón hacia adelante.
+    """
+    try:
+        cal = load_internal_wc_calendar()
+        if cal is None or cal.empty:
+            return set(), None, None
+
+        cal = cal.reset_index(drop=True).copy()
+        cal["__order"] = np.arange(len(cal))
+        cal["home_team"] = cal["home_team"].map(normalize_team_name)
+        cal["away_team"] = cal["away_team"].map(normalize_team_name)
+
+        start_mask = pd.Series(False, index=cal.index)
+        if "fixture_id" in cal.columns:
+            start_mask = start_mask | (cal["fixture_id"].astype(str) == str(PRECISION_START_FIXTURE_ID))
+
+        start_mask = start_mask | (
+            cal["home_team"].isin(PRECISION_START_TEAMS) &
+            cal["away_team"].isin(PRECISION_START_TEAMS)
+        )
+
+        if not start_mask.any():
+            return set(), None, None
+
+        start_idx = int(cal.loc[start_mask, "__order"].min())
+        allowed = cal.loc[cal["__order"] >= start_idx].copy()
+        allowed_keys = {
+            precision_pair_key(r["home_team"], r["away_team"])
+            for _, r in allowed.iterrows()
+        }
+        start_row = cal.loc[cal["__order"] == start_idx].iloc[0]
+        start_date = pd.to_datetime(start_row.get("date"), errors="coerce")
+        return allowed_keys, start_idx, start_date
+    except Exception:
+        return set(), None, None
+
+
 def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=2024, start_from_precision_match=True):
     """
     Evalúa acumulado de aciertos en partidos ya jugados del Mundial.
@@ -5041,8 +5093,34 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
     wc["date_dt"] = pd.to_datetime(wc["date"], errors="coerce")
 
     precision_start_dt = get_precision_start_datetime()
-    if start_from_precision_match and pd.notna(precision_start_dt):
-        wc = wc[wc["date_dt"] >= precision_start_dt].copy()
+    precision_allowed_keys, precision_start_order, precision_order_date = get_precision_allowed_match_keys()
+    partidos_antes_precision = 0
+
+    if start_from_precision_match:
+        before_len = len(wc)
+        if precision_allowed_keys:
+            wc["__precision_pair"] = wc.apply(lambda r: precision_pair_key(r["home_team"], r["away_team"]), axis=1)
+            wc = wc[wc["__precision_pair"].isin(precision_allowed_keys)].copy()
+            wc = wc.drop(columns=["__precision_pair"], errors="ignore")
+        elif pd.notna(precision_start_dt):
+            wc = wc[wc["date_dt"] >= precision_start_dt].copy()
+        partidos_antes_precision = int(before_len - len(wc))
+
+    if not wc.empty:
+        try:
+            cal = load_internal_wc_calendar().reset_index(drop=True)
+            cal["__schedule_order"] = np.arange(len(cal))
+            order_map = {
+                precision_pair_key(r["home_team"], r["away_team"]): int(r["__schedule_order"])
+                for _, r in cal.iterrows()
+            }
+            wc["__schedule_order"] = wc.apply(
+                lambda r: order_map.get(precision_pair_key(r["home_team"], r["away_team"]), 9999),
+                axis=1
+            )
+            wc = wc.sort_values(["__schedule_order", "date_dt"]).drop(columns=["__schedule_order"], errors="ignore")
+        except Exception:
+            wc = wc.sort_values("date_dt")
 
     if wc.empty:
         return pd.DataFrame(), {
@@ -5053,6 +5131,7 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
             "aciertos_1x2": 0,
             "precision_start": precision_start_dt.date().isoformat() if pd.notna(precision_start_dt) else PRECISION_START_DATE,
             "precision_label": PRECISION_START_LABEL,
+            "partidos_excluidos_antes_inicio": partidos_antes_precision,
             "mensaje": f"La medición de precisión empieza desde {PRECISION_START_LABEL}. Aún no hay partidos completados desde ese punto."
         }
 
@@ -5139,6 +5218,7 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
         "aciertos_1x2": int(acc_df["Acierto 1X2"].sum()),
         "precision_start": precision_start_dt.date().isoformat() if pd.notna(precision_start_dt) else PRECISION_START_DATE,
         "precision_label": PRECISION_START_LABEL,
+        "partidos_excluidos_antes_inicio": partidos_antes_precision,
         "mensaje": ""
     }
 
@@ -6504,10 +6584,12 @@ def streamlit_app():
             start_from_precision_match=True
         )
 
+        excluidos = acc_summary.get("partidos_excluidos_antes_inicio", 0) if acc_summary else 0
         st.info(
-            f"La precisión acumulada empieza desde **{PRECISION_START_LABEL}** "
-            f"({acc_summary.get('precision_start', PRECISION_START_DATE)}). "
-            "Los partidos anteriores no se cuentan en este porcentaje."
+            f"La precisión acumulada empieza exactamente desde **{PRECISION_START_LABEL}** "
+            f"({acc_summary.get('precision_start', PRECISION_START_DATE) if acc_summary else PRECISION_START_DATE}). "
+            f"Se excluyen **{excluidos}** partido(s) anteriores según el orden oficial del calendario, "
+            "aunque aparezcan con la misma fecha por diferencia de zona horaria."
         )
 
         if not acc_summary:
