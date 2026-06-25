@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V35_ACCESO_CUPONES_COMPLIANCE"
+MODEL_VERSION = "V36_AUTO_REGISTRO_PAGO"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -6721,6 +6721,24 @@ def init_access_control_db():
             )
             con.execute(
                 """
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL,
+                    provider_payment_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    email TEXT,
+                    amount REAL,
+                    currency TEXT,
+                    coupon_code TEXT,
+                    external_reference TEXT,
+                    created_at TEXT NOT NULL,
+                    raw_summary TEXT,
+                    UNIQUE(provider, provider_payment_id)
+                )
+                """
+            )
+            con.execute(
+                """
                 CREATE TABLE IF NOT EXISTS access_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts TEXT NOT NULL,
@@ -7037,6 +7055,320 @@ def validate_login_token(email, token):
         return False, str(e)[:160]
 
 
+
+
+def mercadopago_settings():
+    """
+    Configuración para registro automático con Mercado Pago Checkout Pro.
+    Requiere MERCADOPAGO_ACCESS_TOKEN en Secrets.
+    """
+    return {
+        "access_token": str(get_config_value("MERCADOPAGO_ACCESS_TOKEN", "") or "").strip(),
+        "currency": str(get_config_value("MERCADOPAGO_CURRENCY", "USD") or "USD").strip().upper(),
+        "base_price": float(str(get_config_value("MERCADOPAGO_BASE_PRICE", get_config_value("PRICE_USD", "5.00"))).replace(",", ".") or 5.0),
+        "coupon_price": float(str(get_config_value("MERCADOPAGO_COUPON_PRICE", "4.00")).replace(",", ".") or 4.0),
+        "public_url": str(get_config_value("APP_PUBLIC_URL", "https://predictor-mundial-2026-edp.streamlit.app/") or "").strip().rstrip("/"),
+        "sandbox": str(get_config_value("MERCADOPAGO_SANDBOX", "false")).lower().strip() in ["1", "true", "yes", "si", "sí", "on"],
+    }
+
+
+def mercadopago_is_configured():
+    return bool(mercadopago_settings().get("access_token"))
+
+
+def get_query_params_safe():
+    if not STREAMLIT_OK:
+        return {}
+    try:
+        return dict(st.query_params)
+    except Exception:
+        try:
+            return st.experimental_get_query_params()
+        except Exception:
+            return {}
+
+
+def query_value(params, key, default=""):
+    val = params.get(key, default)
+    if isinstance(val, list):
+        return val[0] if val else default
+    return val if val is not None else default
+
+
+def build_checkout_back_url(kind="success"):
+    cfg = mercadopago_settings()
+    base = cfg.get("public_url") or "https://predictor-mundial-2026-edp.streamlit.app"
+    return f"{base}/?provider=mercadopago&checkout={kind}"
+
+
+def create_mercadopago_preference(email, price_amount, coupon_code=""):
+    """
+    Crea una preferencia de Checkout Pro.
+    El comprador vuelve a la app y la app verifica el payment_id con la API antes de registrar acceso.
+    """
+    cfg = mercadopago_settings()
+    token = cfg["access_token"]
+    if not token:
+        return False, "MERCADOPAGO_ACCESS_TOKEN no está configurado.", ""
+
+    email = normalize_email(email)
+    if not is_valid_email(email):
+        return False, "Correo inválido.", ""
+
+    coupon_code = str(coupon_code or "").strip().upper()
+    now = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    nonce = secrets.token_hex(4)
+    external_reference = f"mpp|{hash_text(email)[:12]}|{coupon_code or 'NOCOUPON'}|{now}|{nonce}"
+
+    body = {
+        "items": [
+            {
+                "title": "Mundial Predictor Pro - Digital Access",
+                "description": "Educational sports analytics platform for World Cup 2026.",
+                "quantity": 1,
+                "currency_id": cfg["currency"],
+                "unit_price": float(price_amount),
+            }
+        ],
+        "payer": {"email": email},
+        "external_reference": external_reference,
+        "back_urls": {
+            "success": build_checkout_back_url("success"),
+            "failure": build_checkout_back_url("failure"),
+            "pending": build_checkout_back_url("pending"),
+        },
+        "auto_return": "approved",
+        "statement_descriptor": "MUNDIALPRED",
+    }
+
+    notification_url = str(get_config_value("MERCADOPAGO_NOTIFICATION_URL", "") or "").strip()
+    if notification_url:
+        body["notification_url"] = notification_url
+
+    try:
+        res = requests.post(
+            "https://api.mercadopago.com/checkout/preferences",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=25,
+        )
+        if res.status_code not in [200, 201]:
+            return False, f"No se pudo crear el checkout: {res.status_code} {res.text[:180]}", ""
+
+        data = res.json()
+        checkout_url = data.get("sandbox_init_point") if cfg.get("sandbox") else data.get("init_point")
+        checkout_url = checkout_url or data.get("init_point") or data.get("sandbox_init_point")
+        if not checkout_url:
+            return False, "Mercado Pago no devolvió URL de checkout.", ""
+
+        log_access_event(
+            "mercadopago_preference_created",
+            email=email,
+            details={"coupon": coupon_code, "amount": price_amount, "currency": cfg["currency"], "external_reference": external_reference}
+        )
+        return True, "Checkout creado correctamente.", checkout_url
+    except Exception as e:
+        return False, f"Error creando checkout: {str(e)[:180]}", ""
+
+
+def verify_mercadopago_payment(payment_id):
+    """
+    Verifica un pago en Mercado Pago usando su payment_id.
+    Solo si el estado es approved se registra el cliente.
+    """
+    cfg = mercadopago_settings()
+    token = cfg.get("access_token")
+    payment_id = str(payment_id or "").strip()
+    if not token:
+        return False, "MERCADOPAGO_ACCESS_TOKEN no está configurado.", None
+    if not payment_id:
+        return False, "No llegó payment_id.", None
+
+    try:
+        res = requests.get(
+            f"https://api.mercadopago.com/v1/payments/{payment_id}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=25,
+        )
+        if res.status_code != 200:
+            return False, f"No se pudo verificar el pago: {res.status_code} {res.text[:180]}", None
+
+        data = res.json()
+        status = str(data.get("status", "")).lower()
+        if status != "approved":
+            return False, f"El pago no está aprobado. Estado actual: {status or 'desconocido'}", data
+
+        return True, "Pago aprobado.", data
+    except Exception as e:
+        return False, f"Error verificando pago: {str(e)[:180]}", None
+
+
+def extract_email_from_payment(payment_data):
+    try:
+        payer = payment_data.get("payer") or {}
+        email = payer.get("email") or ""
+        if is_valid_email(email):
+            return normalize_email(email)
+    except Exception:
+        pass
+
+    try:
+        additional = payment_data.get("additional_info") or {}
+        payer = additional.get("payer") or {}
+        email = payer.get("email") or ""
+        if is_valid_email(email):
+            return normalize_email(email)
+    except Exception:
+        pass
+
+    return ""
+
+
+def extract_coupon_from_external_reference(external_reference):
+    try:
+        parts = str(external_reference or "").split("|")
+        if len(parts) >= 3 and parts[2] and parts[2] != "NOCOUPON":
+            return parts[2].strip().upper()
+    except Exception:
+        pass
+    return ""
+
+
+def register_verified_payment(provider, provider_payment_id, payment_data):
+    """
+    Registra pago aprobado y cliente pagado sin intervención manual.
+    Evita duplicados por provider_payment_id.
+    """
+    init_access_control_db()
+    provider = str(provider or "mercadopago").strip().lower()
+    provider_payment_id = str(provider_payment_id or "").strip()
+    email = extract_email_from_payment(payment_data)
+    if not is_valid_email(email):
+        return False, "El pago fue aprobado, pero no se encontró un correo válido del comprador."
+
+    status = str(payment_data.get("status", "approved"))
+    amount = float(payment_data.get("transaction_amount") or payment_data.get("total_paid_amount") or 0)
+    currency = str(payment_data.get("currency_id") or mercadopago_settings().get("currency") or "")
+    external_reference = str(payment_data.get("external_reference") or "")
+    coupon_code = extract_coupon_from_external_reference(external_reference)
+    now = datetime.utcnow().isoformat(timespec="seconds")
+
+    raw_summary = json.dumps(
+        {
+            "status": status,
+            "amount": amount,
+            "currency": currency,
+            "external_reference": external_reference,
+            "payment_method": payment_data.get("payment_method_id", ""),
+            "payment_type": payment_data.get("payment_type_id", ""),
+        },
+        ensure_ascii=False
+    )
+
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            existing = con.execute(
+                "SELECT id, email FROM payments WHERE provider=? AND provider_payment_id=?",
+                (provider, provider_payment_id)
+            ).fetchone()
+
+            if existing:
+                # Ya estaba registrado. No incrementa cupón ni sobreescribe datos comerciales.
+                log_access_event("payment_duplicate_return", email=email, details={"provider": provider, "payment_id": provider_payment_id})
+                return True, f"Pago ya estaba registrado. Cliente activo: {email}"
+
+            con.execute(
+                """
+                INSERT INTO payments
+                (provider, provider_payment_id, status, email, amount, currency, coupon_code, external_reference, created_at, raw_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (provider, provider_payment_id, status, email, amount, currency, coupon_code, external_reference, now, raw_summary)
+            )
+            con.commit()
+
+        ok, msg = register_paid_customer(
+            email,
+            coupon_code=coupon_code,
+            price_usd=amount or 5.0,
+            notes=f"Registro automático por pago {provider}: {provider_payment_id}"
+        )
+        if not ok:
+            return False, msg
+
+        log_access_event(
+            "payment_auto_registered",
+            email=email,
+            details={"provider": provider, "payment_id": provider_payment_id, "amount": amount, "currency": currency, "coupon": coupon_code}
+        )
+        track_analytics_event(
+            "payment_auto_registered",
+            language=st.session_state.get("app_language_name", "") if STREAMLIT_OK else "",
+            access_granted=True,
+            details={"provider": provider, "amount": amount, "currency": currency}
+        )
+        return True, f"Pago verificado y cliente registrado automáticamente: {email}"
+    except Exception as e:
+        return False, str(e)[:180]
+
+
+def handle_mercadopago_return():
+    """
+    Procesa retorno de Mercado Pago.
+    Si el pago está aprobado, registra el correo del comprador y envía código dinámico.
+    """
+    if not STREAMLIT_OK or not mercadopago_is_configured():
+        return
+
+    params = get_query_params_safe()
+    provider = str(query_value(params, "provider", "")).lower()
+    checkout = str(query_value(params, "checkout", "")).lower()
+    payment_id = query_value(params, "payment_id", "") or query_value(params, "collection_id", "")
+
+    if provider != "mercadopago" and not payment_id:
+        return
+
+    if checkout == "failure":
+        st.error("El pago no fue aprobado. Puedes intentarlo nuevamente.")
+        return
+    if checkout == "pending":
+        st.warning("El pago quedó pendiente. Cuando Mercado Pago lo apruebe, vuelve a abrir la app o contacta soporte.")
+        return
+    if not payment_id:
+        return
+
+    flag_key = f"mp_payment_processed_{payment_id}"
+    if st.session_state.get(flag_key):
+        return
+
+    with st.spinner("Verificando pago con Mercado Pago..."):
+        ok, msg, payment_data = verify_mercadopago_payment(payment_id)
+        if not ok:
+            st.warning(msg)
+            return
+
+        registered, reg_msg = register_verified_payment("mercadopago", payment_id, payment_data)
+        if not registered:
+            st.error(reg_msg)
+            return
+
+        email = extract_email_from_payment(payment_data)
+        token = generate_login_token(email, purpose="paid")
+        sent, email_msg = send_login_token_email(email, token, purpose="paid")
+
+        st.session_state[flag_key] = True
+        if sent:
+            st.success("Pago aprobado. Tu correo fue registrado automáticamente y te enviamos un código de ingreso.")
+            st.info(f"Revisa el correo: {mask_email(email)}")
+        else:
+            st.success("Pago aprobado y correo registrado automáticamente.")
+            st.warning(f"No se pudo enviar el código automático: {email_msg}")
+        st.caption(reg_msg)
+
+
 def render_screen_protection():
     """
     No existe forma confiable de impedir capturas de pantalla desde una web.
@@ -7097,15 +7429,15 @@ def render_access_admin_dashboard():
     """Panel admin para clientes, cupones y eventos de acceso."""
     st.markdown("### 👥 Accesos, clientes y cupones")
     st.caption(
-        "Sistema interno para prueba gratuita por correo, clientes pagados y códigos dinámicos de inicio de sesión. "
-        "No procesa pagos: el pago se verifica por fuera y luego registras el correo del cliente."
+        "Sistema interno para prueba gratuita por correo, clientes pagados, cupones y códigos dinámicos. "
+        "Si configuras Mercado Pago, la app verifica el pago aprobado y registra el correo automáticamente."
     )
 
     if not init_access_control_db():
         st.error("No se pudo iniciar la base de accesos.")
         return
 
-    tab_clients, tab_coupons, tab_events = st.tabs(["Clientes", "Cupones", "Eventos de acceso"])
+    tab_clients, tab_coupons, tab_payments, tab_events = st.tabs(["Clientes", "Cupones", "Pagos automáticos", "Eventos de acceso"])
 
     with tab_clients:
         st.markdown("#### Registrar cliente pagado")
@@ -7167,6 +7499,37 @@ def render_access_admin_dashboard():
             st.dataframe(safe_streamlit_df(df_coupons), use_container_width=True, hide_index=True)
         except Exception as e:
             st.error(f"No se pudo cargar cupones: {e}")
+
+    with tab_payments:
+        st.markdown("#### Pagos verificados automáticamente")
+        st.caption(
+            "Aquí aparecen pagos que la app verificó con el proveedor antes de registrar el correo del cliente."
+        )
+        try:
+            with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+                df_payments = pd.read_sql_query(
+                    """
+                    SELECT provider, provider_payment_id, status, email, amount, currency, coupon_code, created_at
+                    FROM payments
+                    ORDER BY id DESC
+                    LIMIT 300
+                    """,
+                    con
+                )
+            if not df_payments.empty:
+                df_payments["email"] = df_payments["email"].map(mask_email)
+                st.dataframe(safe_streamlit_df(df_payments), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Descargar pagos CSV",
+                    data=df_payments.to_csv(index=False).encode("utf-8"),
+                    file_name="pagos_verificados.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.info("Aún no hay pagos verificados automáticamente.")
+        except Exception as e:
+            st.error(f"No se pudo cargar pagos: {e}")
 
     with tab_events:
         try:
@@ -7237,6 +7600,7 @@ def render_public_landing(settings):
         once_key="paywall_view"
     )
     init_access_control_db()
+    handle_mercadopago_return()
 
     brand = settings["brand_name"]
     base_price = float(str(settings.get("price_usd", "5")).replace(",", ".") or 5)
@@ -7407,21 +7771,71 @@ def render_public_landing(settings):
 
     with tab_buy:
         st.subheader("Comprar acceso")
-        st.write(f"Precio actual: **USD ${final_price:.2f}**")
+        st.write(f"Precio base: **USD ${base_price:.2f}**")
         if coupon:
-            st.caption(f"Cupón aplicado: {coupon['code']}. Debes usar este mismo cupón al momento de solicitar/confirmar tu acceso.")
-        if payment_link:
+            st.success(f"Precio con cupón: **USD ${final_price:.2f}**")
+        st.caption(
+            "El registro puede hacerse automáticamente si el pago vuelve aprobado desde Mercado Pago. "
+            "Después, cada ingreso usa un código dinámico enviado al correo registrado."
+        )
+
+        mp_cfg = mercadopago_settings()
+        if mercadopago_is_configured():
+            st.markdown("#### Pago automático con Mercado Pago")
+            purchase_email = st.text_input("Correo del comprador", key="mp_purchase_email")
+            mp_amount = mp_cfg["coupon_price"] if coupon else mp_cfg["base_price"]
+            st.caption(f"Precio en checkout: **{mp_cfg['currency']} {mp_amount:.2f}**")
+
+            if st.button("Generar enlace de pago", type="primary", use_container_width=True):
+                email = normalize_email(purchase_email)
+                if not is_valid_email(email):
+                    st.error("Escribe un correo válido para asociar el acceso.")
+                else:
+                    ok, msg, checkout_url = create_mercadopago_preference(
+                        email=email,
+                        price_amount=mp_amount,
+                        coupon_code=coupon["code"] if coupon else ""
+                    )
+                    if ok:
+                        st.session_state["mp_checkout_url"] = checkout_url
+                        st.session_state["mp_checkout_email"] = email
+                        track_analytics_event(
+                            "payment_checkout_created",
+                            language=st.session_state.get("app_language_name", ""),
+                            access_granted=False,
+                            admin_mode=False,
+                            details={"provider": "mercadopago", "price": mp_amount, "currency": mp_cfg["currency"]}
+                        )
+                        st.success("Enlace de pago creado. Ábrelo para completar la compra.")
+                    else:
+                        st.error(msg)
+
+            checkout_url = st.session_state.get("mp_checkout_url", "")
+            if checkout_url:
+                st.link_button("Abrir checkout seguro", checkout_url, type="primary", use_container_width=True)
+                st.info(
+                    "Después del pago aprobado, Mercado Pago te devolverá a esta página. "
+                    "La app verificará el pago, registrará tu correo automáticamente y te enviará el código de ingreso."
+                )
+
+        elif payment_link:
+            st.markdown("#### Enlace de pago manual")
             if st.button("Registrar intención de compra", use_container_width=True, help="Cuenta el clic y muestra el botón de pago."):
-                track_analytics_event("payment_intent_click", language=st.session_state.get("app_language_name", ""), access_granted=False, admin_mode=False, details={"price_usd": final_price, "coupon": coupon_input})
-                st.info("Abre el enlace de pago y luego envía tu correo para activar el acceso.")
+                track_analytics_event(
+                    "payment_intent_click",
+                    language=st.session_state.get("app_language_name", ""),
+                    access_granted=False,
+                    admin_mode=False,
+                    details={"price_usd": final_price, "coupon": coupon_input}
+                )
+                st.info("Abre el enlace de pago. Si el proveedor no devuelve confirmación automática, el acceso se activa manualmente.")
             st.link_button("Abrir enlace de pago", payment_link, type="primary", use_container_width=True)
         else:
-            st.warning("Aún no configuraste PAYMENT_LINK. Puedes vender manualmente y registrar el correo desde el panel admin.")
+            st.warning(
+                "Aún no configuraste un enlace de pago ni MERCADOPAGO_ACCESS_TOKEN. "
+                "Puedes registrar clientes manualmente desde el panel admin."
+            )
 
-        st.caption(
-            "Después de verificar el pago, el administrador registra tu correo. "
-            "A partir de ahí, cada ingreso se valida con un código dinámico enviado a tu correo."
-        )
         if support:
             st.caption(f"Soporte: {support}")
 
@@ -7791,7 +8205,7 @@ def streamlit_app():
         admin_mode=admin_mode,
         details={
             "require_access": access_settings.get("require_access", False),
-            "privacy_version": "V35_ACCESO_CUPONES_COMPLIANCE",
+            "privacy_version": "V36_AUTO_REGISTRO_PAGO",
             "analytics_scope": "anonymous_events_only"
         },
         once_key="session_start"
