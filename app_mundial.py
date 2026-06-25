@@ -14,6 +14,7 @@
 # ============================================================
 
 import os
+import re
 import json
 import math
 import warnings
@@ -122,7 +123,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V36_AUTO_REGISTRO_PAGO"
+MODEL_VERSION = "V37_FIX_EMAIL_REGEX"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -6650,8 +6651,12 @@ def normalize_email(email):
 
 
 def is_valid_email(email):
+    """Valida formato básico de correo sin guardar datos sensibles."""
     email = normalize_email(email)
-    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
+    try:
+        return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
+    except Exception:
+        return False
 
 
 def hash_text(value):
