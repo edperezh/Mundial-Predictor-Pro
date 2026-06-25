@@ -10,7 +10,7 @@
 #   - Generar probabilidades de resultado y marcadores probables.
 #
 # IMPORTANTE:
-#   Este código es para análisis estadístico/educativo. No usa cuotas ni casas de apuestas.
+#   Este código es para análisis estadístico/educativo. No procesa pagos de juego ni actividades reguladas.
 # ============================================================
 
 import os
@@ -21,6 +21,11 @@ import random
 import pickle
 import sqlite3
 import uuid
+import hashlib
+import secrets
+import smtplib
+import ssl
+from email.message import EmailMessage
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -117,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V33_PRIVACIDAD_ANALITICA"
+MODEL_VERSION = "V35_ACCESO_CUPONES_COMPLIANCE"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -131,6 +136,8 @@ MODEL_ARTIFACT_PATH = MODEL_DIR / "modelo_oficial.pkl"
 MODEL_METADATA_PATH = MODEL_DIR / "metadata_modelo.json"
 WC_SNAPSHOT_FILE = DATA_DIR / "snapshot_mundial_2026.csv"
 ANALYTICS_DB_PATH = DATA_DIR / "analytics_visitas.sqlite"
+ANALYTICS_EMAIL_STATE_PATH = DATA_DIR / "analytics_email_state.json"
+ACCESS_CONTROL_DB_PATH = DATA_DIR / "access_control.sqlite"
 
 
 # La precisión acumulada del Mundial se empieza a medir desde este partido hacia adelante.
@@ -6221,6 +6228,12 @@ def render_analytics_dashboard():
         use_container_width=True
     )
 
+    st.divider()
+    render_analytics_email_controls()
+
+    st.divider()
+    render_access_admin_dashboard()
+
     with st.expander("Mantenimiento"):
         st.write("Usa esto solo si quieres reiniciar el conteo durante pruebas.")
         confirm = st.checkbox("Confirmo que quiero borrar la analítica local", key="confirm_clear_analytics")
@@ -6236,6 +6249,305 @@ def render_analytics_dashboard():
             except Exception as e:
                 st.error(f"No se pudo borrar: {e}")
 
+
+
+
+def analytics_email_settings():
+    """
+    Configuración de envío de reportes de analítica por correo.
+    Debe configurarse en Streamlit Secrets o variables de entorno.
+    """
+    enabled_raw = str(get_config_value("ANALYTICS_EMAIL_ENABLED", "false")).lower().strip()
+    enabled = enabled_raw in ["1", "true", "yes", "si", "sí", "on"]
+
+    def _int_secret(name, default):
+        try:
+            return int(str(get_config_value(name, str(default))).strip())
+        except Exception:
+            return default
+
+    return {
+        "enabled": enabled,
+        "to": str(get_config_value("ANALYTICS_EMAIL_TO", "") or "").strip(),
+        "interval_minutes": max(15, _int_secret("ANALYTICS_EMAIL_INTERVAL_MINUTES", 60)),
+        "smtp_host": str(get_config_value("SMTP_HOST", "") or "").strip(),
+        "smtp_port": _int_secret("SMTP_PORT", 465),
+        "smtp_user": str(get_config_value("SMTP_USER", "") or "").strip(),
+        "smtp_password": str(get_config_value("SMTP_PASSWORD", "") or "").strip(),
+        "smtp_from": str(get_config_value("SMTP_FROM", "") or "").strip(),
+    }
+
+
+def read_analytics_email_state():
+    try:
+        if ANALYTICS_EMAIL_STATE_PATH.exists():
+            return json.loads(ANALYTICS_EMAIL_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def write_analytics_email_state(state):
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        ANALYTICS_EMAIL_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def analytics_email_ready(settings=None):
+    settings = settings or analytics_email_settings()
+    required = ["to", "smtp_host", "smtp_user", "smtp_password"]
+    return settings.get("enabled", False) and all(str(settings.get(k, "")).strip() for k in required)
+
+
+def build_analytics_email_body(df=None):
+    """
+    Construye un reporte de texto plano.
+    No incluye IP, correos de usuarios, códigos, contraseñas ni datos sensibles.
+    """
+    if df is None:
+        df = load_analytics_events()
+
+    now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if df is None or df.empty:
+        return f"""Mundial Predictor Pro - Reporte de analítica
+
+Fecha de envío: {now_local}
+
+Aún no hay eventos registrados.
+
+Este reporte solo usa analítica anónima de la app.
+No incluye IP, nombres, correos de usuarios, tarjetas, contraseñas, API keys ni códigos ingresados.
+"""
+
+    summary = summarize_analytics(df)
+    last_24 = df.copy()
+    try:
+        last_24["ts_dt"] = pd.to_datetime(last_24["ts"], errors="coerce", utc=True)
+        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(hours=24)
+        last_24 = last_24[last_24["ts_dt"] >= cutoff]
+    except Exception:
+        last_24 = pd.DataFrame()
+
+    event_counts = df.groupby("event_type").size().sort_values(ascending=False)
+    event_text = "\n".join([f"- {idx}: {int(val)}" for idx, val in event_counts.items()])
+
+    daily = (
+        df[df["event_type"].isin(["session_start", "paywall_view", "access_granted"])]
+        .groupby(["date", "event_type"])["session_id"]
+        .nunique()
+        .reset_index(name="sesiones")
+        .sort_values(["date", "event_type"], ascending=[False, True])
+        .head(20)
+    )
+    daily_text = "Sin datos diarios."
+    if not daily.empty:
+        daily_text = "\n".join(
+            [f"- {r['date']} · {r['event_type']}: {int(r['sesiones'])}" for _, r in daily.iterrows()]
+        )
+
+    recent = df.head(10).copy()
+    recent_text = "Sin eventos recientes."
+    if not recent.empty:
+        recent_text = "\n".join(
+            [
+                f"- {str(r.get('ts', ''))[:19]} · {r.get('event_type', '')} · sesión {str(r.get('session_id', ''))[:8]}..."
+                for _, r in recent.iterrows()
+            ]
+        )
+
+    last24_sessions = 0
+    last24_events = 0
+    last24_paywall = 0
+    last24_access = 0
+    if last_24 is not None and not last_24.empty:
+        last24_sessions = int(last_24["session_id"].nunique()) if "session_id" in last_24 else 0
+        last24_events = int(len(last_24))
+        last24_paywall = int((last_24["event_type"] == "paywall_view").sum()) if "event_type" in last_24 else 0
+        last24_access = int((last_24["event_type"] == "access_granted").sum()) if "event_type" in last_24 else 0
+
+    return f"""Mundial Predictor Pro - Reporte de analítica
+
+Fecha de envío: {now_local}
+
+RESUMEN GENERAL
+- Sesiones anónimas totales: {summary.get('sessions', 0)}
+- Eventos totales: {summary.get('events', 0)}
+- Vistas del paywall: {summary.get('paywall_views', 0)}
+- Accesos aprobados: {summary.get('access_granted', 0)}
+- Días registrados: {summary.get('days', 0)}
+
+ÚLTIMAS 24 HORAS
+- Sesiones anónimas: {last24_sessions}
+- Eventos: {last24_events}
+- Vistas del paywall: {last24_paywall}
+- Accesos aprobados: {last24_access}
+
+EVENTOS POR TIPO
+{event_text}
+
+VISITAS / ACCESOS POR DÍA
+{daily_text}
+
+ÚLTIMOS EVENTOS
+{recent_text}
+
+Privacidad:
+Este reporte solo usa analítica anónima de la app.
+No incluye IP, nombres, correos de usuarios, tarjetas, contraseñas, API keys ni códigos ingresados.
+"""
+
+
+def send_analytics_email_report(force=False):
+    """
+    Envía reporte de analítica por SMTP.
+    Retorna (ok, mensaje).
+    """
+    settings = analytics_email_settings()
+    if not analytics_email_ready(settings):
+        return False, "Correo no configurado. Revisa ANALYTICS_EMAIL_ENABLED, ANALYTICS_EMAIL_TO, SMTP_HOST, SMTP_USER y SMTP_PASSWORD."
+
+    df = load_analytics_events()
+    body = build_analytics_email_body(df)
+
+    sender = settings.get("smtp_from") or settings["smtp_user"]
+    recipient = settings["to"]
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Mundial Predictor Pro - Analítica {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.set_content(body)
+
+    try:
+        if df is not None and not df.empty:
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            msg.add_attachment(
+                csv_bytes,
+                maintype="text",
+                subtype="csv",
+                filename=f"analytics_visitas_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+            )
+    except Exception:
+        pass
+
+    try:
+        port = int(settings["smtp_port"])
+        host = settings["smtp_host"]
+        user = settings["smtp_user"]
+        password = settings["smtp_password"]
+
+        if port == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(host, port, context=context, timeout=25) as server:
+                server.login(user, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=25) as server:
+                server.starttls(context=ssl.create_default_context())
+                server.login(user, password)
+                server.send_message(msg)
+
+        state = read_analytics_email_state()
+        state["last_sent_at"] = datetime.utcnow().isoformat(timespec="seconds")
+        state["last_sent_to"] = recipient
+        state["last_status"] = "ok"
+        write_analytics_email_state(state)
+
+        track_analytics_event(
+            "analytics_email_sent",
+            language=st.session_state.get("app_language_name", "") if STREAMLIT_OK else "",
+            access_granted=True,
+            admin_mode=bool(st.session_state.get("admin_mode", False)) if STREAMLIT_OK else False,
+            details={"recipient_configured": True}
+        )
+        return True, f"Reporte enviado a {recipient}."
+    except Exception as e:
+        state = read_analytics_email_state()
+        state["last_error_at"] = datetime.utcnow().isoformat(timespec="seconds")
+        state["last_status"] = "error"
+        state["last_error"] = str(e)[:300]
+        write_analytics_email_state(state)
+        return False, f"No se pudo enviar el correo: {str(e)[:220]}"
+
+
+def maybe_send_hourly_analytics_email():
+    """
+    Envía automáticamente si ya pasó el intervalo configurado.
+    En Streamlit esto se evalúa cuando la app recibe una visita/ejecución.
+    Para envío exacto cada hora sin visitas se necesita un cron externo que despierte la app.
+    """
+    try:
+        settings = analytics_email_settings()
+        if not analytics_email_ready(settings):
+            return False, "No configurado"
+
+        state = read_analytics_email_state()
+        last_sent = state.get("last_sent_at")
+        interval = int(settings.get("interval_minutes", 60))
+
+        if last_sent:
+            last_ts = pd.to_datetime(last_sent, errors="coerce", utc=True)
+            if pd.notna(last_ts):
+                elapsed = (pd.Timestamp.utcnow() - last_ts).total_seconds() / 60
+                if elapsed < interval:
+                    return False, f"Aún no toca enviar. Faltan aprox. {int(interval - elapsed)} min."
+
+        return send_analytics_email_report(force=True)
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def render_analytics_email_controls():
+    """Controles admin para configurar/probar envío por correo."""
+    st.markdown("### 📩 Reporte por correo")
+    settings = analytics_email_settings()
+    state = read_analytics_email_state()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Email automático", "Activo" if settings.get("enabled") else "Inactivo")
+    c2.metric("Intervalo", f"{settings.get('interval_minutes', 60)} min")
+    c3.metric("Último envío", state.get("last_sent_at", "Nunca"))
+
+    safe_to = settings.get("to", "")
+    if safe_to:
+        st.caption(f"Destino configurado: {safe_to}")
+    else:
+        st.warning("No hay ANALYTICS_EMAIL_TO configurado.")
+
+    with st.expander("Configuración necesaria en Secrets"):
+        st.code("""ANALYTICS_EMAIL_ENABLED = "true"
+ANALYTICS_EMAIL_TO = "nivisyrafael@gmail.com"
+ANALYTICS_EMAIL_INTERVAL_MINUTES = "60"
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = "465"
+SMTP_USER = "tu_correo@gmail.com"
+SMTP_PASSWORD = "tu_contraseña_de_aplicacion"
+SMTP_FROM = "Mundial Predictor Pro <tu_correo@gmail.com>"
+""", language="toml")
+        st.caption(
+            "Para Gmail debes usar una contraseña de aplicación, no tu contraseña normal. "
+            "El envío automático ocurre cuando la app se ejecuta; para exactitud cada hora se recomienda un ping externo."
+        )
+
+    col_send, col_auto = st.columns(2)
+    with col_send:
+        if st.button("📤 Enviar reporte ahora", use_container_width=True):
+            ok, msg = send_analytics_email_report(force=True)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+    with col_auto:
+        if st.button("⏱️ Probar envío automático", use_container_width=True):
+            ok, msg = maybe_send_hourly_analytics_email()
+            if ok:
+                st.success(msg)
+            else:
+                st.info(msg)
 
 
 def render_privacy_policy_section(compact=False):
@@ -6262,7 +6574,7 @@ def render_privacy_policy_section(compact=False):
 
     st.info(
         "Usamos analítica anónima para contar visitas y mejorar la plataforma. "
-        "No guardamos nombres, correos, tarjetas, contraseñas, API keys ni códigos ingresados dentro de la analítica interna."
+        "Si solicitas prueba gratuita o acceso de cliente, usamos tu correo solo para enviarte códigos dinámicos y administrar el acceso."
     )
 
     st.markdown(
@@ -6283,16 +6595,20 @@ Mundial Predictor Pro may collect anonymous usage events such as:
 
 These events are used only to measure platform usage, improve the product, detect errors, and understand general activity.
 
+### Email access / Acceso por correo
+
+If you request a free trial or customer login, we may store your email address only to send dynamic access codes, manage your trial, validate customer access, and provide support.
+
+Si solicitas una prueba gratuita o ingreso como cliente, podemos guardar tu correo únicamente para enviarte códigos dinámicos, administrar tu prueba, validar tu acceso y dar soporte.
+
 ### What we do not store directly / Qué no guardamos directamente
 
-Inside the app analytics system, we do not store:
+Inside the app analytics and access system, we do not store:
 
-- Names / nombres
-- Email addresses / correos electrónicos
 - Payment card information / tarjetas o datos de pago
 - Passwords / contraseñas
 - API keys / claves API
-- Access codes entered by users / códigos escritos por usuarios
+- Exact access codes entered by users / códigos exactos escritos por usuarios
 - Precise location / ubicación exacta
 - IP addresses / direcciones IP
 
@@ -6316,11 +6632,556 @@ The information is used for:
 
 ### Sports analytics notice / Aviso de análisis deportivo
 
-Mundial Predictor Pro is an educational sports analytics platform. The probabilities shown are statistical estimates and do not guarantee match results. This platform is not betting advice.
+Mundial Predictor Pro is an educational sports analytics platform. The probabilities shown are statistical estimates and do not guarantee match results. This platform is not financial advice or a regulated gaming service.
 
 If you have questions about privacy or data handling, contact support.
         """
     )
+
+
+
+
+# ============================================================
+# 10E. ACCESOS, PRUEBA GRATUITA, CUPONES Y CÓDIGOS DINÁMICOS
+# ============================================================
+
+def normalize_email(email):
+    return str(email or "").strip().lower()
+
+
+def is_valid_email(email):
+    email = normalize_email(email)
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
+
+
+def hash_text(value):
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def mask_email(email):
+    email = normalize_email(email)
+    if "@" not in email:
+        return "usuario"
+    name, domain = email.split("@", 1)
+    if len(name) <= 2:
+        masked = name[:1] + "***"
+    else:
+        masked = name[:2] + "***" + name[-1:]
+    return masked + "@" + domain
+
+
+def init_access_control_db():
+    """Crea tablas para prueba gratuita, clientes pagados, cupones y códigos OTP."""
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customers (
+                    email TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'trial',
+                    trial_used INTEGER DEFAULT 0,
+                    coupon_code TEXT,
+                    price_usd REAL,
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_login_at TEXT,
+                    total_logins INTEGER DEFAULT 0
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS login_tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL,
+                    token_hash TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used INTEGER DEFAULT 0
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS coupons (
+                    code TEXT PRIMARY KEY,
+                    price_usd REAL NOT NULL DEFAULT 4.0,
+                    discount_usd REAL NOT NULL DEFAULT 1.0,
+                    active INTEGER DEFAULT 1,
+                    max_uses INTEGER DEFAULT 100,
+                    uses INTEGER DEFAULT 0,
+                    expires_at TEXT,
+                    created_at TEXT NOT NULL,
+                    notes TEXT
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS access_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    email TEXT,
+                    email_hash TEXT,
+                    event_type TEXT NOT NULL,
+                    details TEXT
+                )
+                """
+            )
+            con.execute("CREATE INDEX IF NOT EXISTS idx_access_events_ts ON access_events(ts)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_access_events_email ON access_events(email)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_login_tokens_email ON login_tokens(email)")
+            con.commit()
+        ensure_default_coupon()
+        return True
+    except Exception:
+        return False
+
+
+def ensure_default_coupon():
+    """Crea un cupón inicial para promoción de USD 5 a USD 4."""
+    try:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT OR IGNORE INTO coupons
+                (code, price_usd, discount_usd, active, max_uses, uses, expires_at, created_at, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("BETA-TIKTOK-2026", 4.0, 1.0, 1, 200, 0, None, now, "Cupón promocional beta: precio USD 4")
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def log_access_event(event_type, email="", details=None):
+    try:
+        init_access_control_db()
+        email = normalize_email(email)
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT INTO access_events (ts, email, email_hash, event_type, details)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (now, email, hash_text(email) if email else "", str(event_type), json.dumps(details or {}, ensure_ascii=False))
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def get_coupon(code):
+    init_access_control_db()
+    code = str(code or "").strip().upper()
+    if not code:
+        return None
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute("SELECT * FROM coupons WHERE code = ?", (code,)).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        if int(data.get("active", 0)) != 1:
+            return None
+        if data.get("expires_at"):
+            try:
+                if pd.Timestamp.utcnow() > pd.to_datetime(data["expires_at"], utc=True):
+                    return None
+            except Exception:
+                pass
+        if int(data.get("uses", 0)) >= int(data.get("max_uses", 0)):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def increment_coupon_use(code):
+    code = str(code or "").strip().upper()
+    if not code:
+        return
+    try:
+        init_access_control_db()
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute("UPDATE coupons SET uses = uses + 1 WHERE code = ?", (code,))
+            con.commit()
+    except Exception:
+        pass
+
+
+def create_coupon(code, price_usd=4.0, max_uses=100, notes=""):
+    init_access_control_db()
+    code = str(code or "").strip().upper().replace(" ", "-")
+    if not code:
+        return False, "Código vacío."
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO coupons
+                (code, price_usd, discount_usd, active, max_uses, uses, expires_at, created_at, notes)
+                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT uses FROM coupons WHERE code = ?), 0), ?, ?, ?)
+                """,
+                (code, float(price_usd), max(0.0, 5.0 - float(price_usd)), 1, int(max_uses), code, None, now, str(notes or ""))
+            )
+            con.commit()
+        log_access_event("coupon_created", details={"code": code, "price_usd": price_usd, "max_uses": max_uses})
+        return True, f"Cupón {code} creado/actualizado."
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def register_paid_customer(email, coupon_code="", price_usd=5.0, notes=""):
+    init_access_control_db()
+    email = normalize_email(email)
+    if not is_valid_email(email):
+        return False, "Correo inválido."
+    coupon_code = str(coupon_code or "").strip().upper()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT INTO customers (email, status, trial_used, coupon_code, price_usd, notes, created_at, updated_at)
+                VALUES (?, 'paid', 1, ?, ?, ?, ?, ?)
+                ON CONFLICT(email) DO UPDATE SET
+                    status='paid',
+                    trial_used=1,
+                    coupon_code=excluded.coupon_code,
+                    price_usd=excluded.price_usd,
+                    notes=excluded.notes,
+                    updated_at=excluded.updated_at
+                """,
+                (email, coupon_code, float(price_usd), str(notes or ""), now, now)
+            )
+            con.commit()
+        if coupon_code:
+            increment_coupon_use(coupon_code)
+        log_access_event("paid_customer_registered", email=email, details={"coupon": coupon_code, "price_usd": price_usd})
+        return True, f"Cliente pagado registrado: {email}"
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def get_customer(email):
+    init_access_control_db()
+    email = normalize_email(email)
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute("SELECT * FROM customers WHERE email = ?", (email,)).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def create_or_get_trial_customer(email, coupon_code=""):
+    """
+    Crea una prueba gratuita por correo si no ha sido usada.
+    La prueba no pretende ser infalible por dispositivo; es control por correo.
+    """
+    init_access_control_db()
+    email = normalize_email(email)
+    if not is_valid_email(email):
+        return False, "Correo inválido."
+    current = get_customer(email)
+    if current and int(current.get("trial_used", 0)) == 1 and current.get("status") != "paid":
+        log_access_event("trial_rejected_already_used", email=email)
+        return False, "Este correo ya usó la prueba gratuita. Para seguir usando la app, compra el acceso."
+    if current and current.get("status") == "paid":
+        return True, "Este correo ya tiene acceso pagado. Solicita tu código de ingreso."
+
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT OR IGNORE INTO customers
+                (email, status, trial_used, coupon_code, price_usd, notes, created_at, updated_at)
+                VALUES (?, 'trial', 1, ?, 0, 'Prueba gratuita inicial', ?, ?)
+                """,
+                (email, str(coupon_code or "").strip().upper(), now, now)
+            )
+            con.commit()
+        log_access_event("trial_customer_created", email=email)
+        return True, "Prueba gratuita creada. Revisa tu correo para ingresar el código."
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def generate_login_token(email, purpose="trial"):
+    """
+    Genera código dinámico de un solo uso, cambia en cada inicio de sesión.
+    No se guarda el código real, solo su hash.
+    """
+    init_access_control_db()
+    email = normalize_email(email)
+    token = f"{secrets.randbelow(900000) + 100000}"
+    token_hash = hash_text(email + ":" + token)
+    now = datetime.utcnow()
+    expires = now + pd.Timedelta(minutes=10)
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT INTO login_tokens (email, token_hash, purpose, created_at, expires_at, used)
+                VALUES (?, ?, ?, ?, ?, 0)
+                """,
+                (email, token_hash, purpose, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds"))
+            )
+            con.commit()
+        log_access_event("login_token_generated", email=email, details={"purpose": purpose})
+        return token
+    except Exception:
+        return ""
+
+
+def send_plain_email(to_email, subject, body):
+    """Envía correo genérico por SMTP usando la misma configuración segura de Secrets."""
+    settings = analytics_email_settings()
+    if not settings.get("smtp_host") or not settings.get("smtp_user") or not settings.get("smtp_password"):
+        return False, "SMTP no configurado. Configura SMTP_HOST, SMTP_USER y SMTP_PASSWORD en Secrets."
+
+    msg = EmailMessage()
+    sender = settings.get("smtp_from") or settings.get("smtp_user")
+    msg["From"] = sender
+    msg["To"] = normalize_email(to_email)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        port = int(settings.get("smtp_port", 465))
+        host = settings.get("smtp_host")
+        user = settings.get("smtp_user")
+        password = settings.get("smtp_password")
+        if port == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(host, port, context=context, timeout=25) as server:
+                server.login(user, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=25) as server:
+                server.starttls(context=ssl.create_default_context())
+                server.login(user, password)
+                server.send_message(msg)
+        return True, "Correo enviado."
+    except Exception as e:
+        return False, str(e)[:220]
+
+
+def send_login_token_email(email, token, purpose="trial"):
+    brand = str(get_config_value("APP_BRAND_NAME", "Mundial Predictor Pro")).strip()
+    app_url = str(get_config_value("APP_PUBLIC_URL", "https://predictor-mundial-2026-edp.streamlit.app/")).strip()
+    subject = f"Código de acceso - {brand}"
+    label = "prueba gratuita" if purpose == "trial" else "acceso de cliente"
+    body = f"""Hola,
+
+Tu código dinámico de {label} para {brand} es:
+
+{token}
+
+Este código vence en 10 minutos y cambia en cada inicio de sesión.
+
+Ingresa aquí:
+{app_url}
+
+Importante:
+{brand} es una plataforma educativa de análisis deportivo con datos. Las probabilidades son estimaciones estadísticas y no garantizan resultados.
+
+Si no solicitaste este código, puedes ignorar este correo.
+"""
+    return send_plain_email(email, subject, body)
+
+
+def validate_login_token(email, token):
+    init_access_control_db()
+    email = normalize_email(email)
+    token_hash = hash_text(email + ":" + str(token or "").strip())
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                """
+                SELECT * FROM login_tokens
+                WHERE email = ? AND token_hash = ? AND used = 0
+                ORDER BY id DESC LIMIT 1
+                """,
+                (email, token_hash)
+            ).fetchone()
+            if not row:
+                log_access_event("login_token_invalid", email=email)
+                return False, "Código inválido."
+            data = dict(row)
+            exp = pd.to_datetime(data["expires_at"], utc=True)
+            if pd.Timestamp.utcnow() > exp:
+                log_access_event("login_token_expired", email=email)
+                return False, "Código vencido. Solicita uno nuevo."
+            con.execute("UPDATE login_tokens SET used = 1 WHERE id = ?", (data["id"],))
+            con.execute(
+                "UPDATE customers SET last_login_at = ?, total_logins = COALESCE(total_logins,0)+1, updated_at=? WHERE email = ?",
+                (datetime.utcnow().isoformat(timespec="seconds"), datetime.utcnow().isoformat(timespec="seconds"), email)
+            )
+            con.commit()
+        log_access_event("login_token_validated", email=email, details={"purpose": data.get("purpose", "")})
+        return True, data.get("purpose", "access")
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def render_screen_protection():
+    """
+    No existe forma confiable de impedir capturas de pantalla desde una web.
+    Esta capa solo disuade: marca de agua, bloqueo de clic derecho/atajos comunes y blur al imprimir.
+    """
+    if str(get_config_value("APP_ENABLE_SCREEN_PROTECTION", "true")).lower().strip() not in ["1", "true", "yes", "si", "sí", "on"]:
+        return
+
+    access_email = st.session_state.get("access_email", "")
+    watermark = f"Uso personal · {mask_email(access_email)}" if access_email else "Mundial Predictor Pro · Uso personal"
+
+    st.markdown(f"""
+    <style>
+      .mpp-watermark {{
+          position: fixed;
+          right: 16px;
+          bottom: 12px;
+          z-index: 999999;
+          opacity: 0.42;
+          font-size: 12px;
+          padding: 6px 10px;
+          border-radius: 999px;
+          background: rgba(15, 23, 42, 0.08);
+          color: rgba(100, 116, 139, 0.95);
+          pointer-events: none;
+      }}
+      @media print {{
+          body {{ filter: blur(8px); }}
+      }}
+    </style>
+    <div class="mpp-watermark">{watermark}</div>
+    """, unsafe_allow_html=True)
+
+    try:
+        components.html(
+            """
+            <script>
+              document.addEventListener('contextmenu', event => event.preventDefault());
+              document.addEventListener('keydown', function(e) {
+                const key = String(e.key || '').toLowerCase();
+                if ((e.ctrlKey || e.metaKey) && ['s','p','u'].includes(key)) {
+                  e.preventDefault();
+                }
+                if (key === 'printscreen') {
+                  try { navigator.clipboard.writeText(''); } catch(err) {}
+                }
+              });
+            </script>
+            """,
+            height=0,
+            width=0
+        )
+    except Exception:
+        pass
+
+
+def render_access_admin_dashboard():
+    """Panel admin para clientes, cupones y eventos de acceso."""
+    st.markdown("### 👥 Accesos, clientes y cupones")
+    st.caption(
+        "Sistema interno para prueba gratuita por correo, clientes pagados y códigos dinámicos de inicio de sesión. "
+        "No procesa pagos: el pago se verifica por fuera y luego registras el correo del cliente."
+    )
+
+    if not init_access_control_db():
+        st.error("No se pudo iniciar la base de accesos.")
+        return
+
+    tab_clients, tab_coupons, tab_events = st.tabs(["Clientes", "Cupones", "Eventos de acceso"])
+
+    with tab_clients:
+        st.markdown("#### Registrar cliente pagado")
+        c1, c2, c3 = st.columns([1.3, .7, .7])
+        with c1:
+            paid_email = st.text_input("Correo del cliente", key="admin_paid_email")
+        with c2:
+            paid_coupon = st.text_input("Cupón usado", key="admin_paid_coupon")
+        with c3:
+            paid_price = st.number_input("Precio USD", min_value=0.0, value=5.0, step=0.5, key="admin_paid_price")
+        paid_notes = st.text_input("Notas internas", key="admin_paid_notes")
+        if st.button("Guardar cliente pagado", use_container_width=True):
+            ok, msg = register_paid_customer(paid_email, paid_coupon, paid_price, paid_notes)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        try:
+            with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+                df_customers = pd.read_sql_query(
+                    "SELECT email, status, trial_used, coupon_code, price_usd, created_at, last_login_at, total_logins, notes FROM customers ORDER BY updated_at DESC",
+                    con
+                )
+            if not df_customers.empty:
+                st.dataframe(safe_streamlit_df(df_customers), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Descargar clientes CSV",
+                    data=df_customers.to_csv(index=False).encode("utf-8"),
+                    file_name="clientes_acceso.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.info("Todavía no hay clientes registrados.")
+        except Exception as e:
+            st.error(f"No se pudo cargar clientes: {e}")
+
+    with tab_coupons:
+        st.markdown("#### Crear cupón promocional")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            coupon_code = st.text_input("Código cupón", value="BETA-TIKTOK-2026", key="admin_coupon_code")
+        with c2:
+            coupon_price = st.number_input("Precio con cupón USD", min_value=0.0, value=4.0, step=0.5, key="admin_coupon_price")
+        with c3:
+            coupon_uses = st.number_input("Usos máximos", min_value=1, value=200, step=10, key="admin_coupon_uses")
+        coupon_notes = st.text_input("Notas cupón", value="Campaña promocional", key="admin_coupon_notes")
+        if st.button("Crear / actualizar cupón", use_container_width=True):
+            ok, msg = create_coupon(coupon_code, coupon_price, coupon_uses, coupon_notes)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        try:
+            with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+                df_coupons = pd.read_sql_query("SELECT * FROM coupons ORDER BY created_at DESC", con)
+            st.dataframe(safe_streamlit_df(df_coupons), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"No se pudo cargar cupones: {e}")
+
+    with tab_events:
+        try:
+            with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+                df_events = pd.read_sql_query(
+                    "SELECT ts, email, event_type, details FROM access_events ORDER BY id DESC LIMIT 300",
+                    con
+                )
+            if not df_events.empty:
+                df_events["email"] = df_events["email"].map(mask_email)
+                st.dataframe(safe_streamlit_df(df_events), use_container_width=True, hide_index=True)
+            else:
+                st.info("Sin eventos de acceso todavía.")
+        except Exception as e:
+            st.error(f"No se pudo cargar eventos: {e}")
 
 
 def parse_access_codes(raw_codes):
@@ -6362,12 +7223,23 @@ def monetization_settings():
 
 def render_public_landing(settings):
     """
-    Pantalla de entrada para monetizar sin mostrar datos personales.
-    Importante: no oculta identidad ante procesadores de pago, bancos o autoridades.
+    Pantalla pública con:
+    - prueba gratuita por correo una sola vez,
+    - cupones de descuento,
+    - acceso de cliente pagado por correo + código dinámico,
+    - lenguaje seguro para revisión de pasarelas.
     """
-    track_analytics_event("paywall_view", language=st.session_state.get("app_language_name", ""), access_granted=False, admin_mode=False, once_key="paywall_view")
+    track_analytics_event(
+        "paywall_view",
+        language=st.session_state.get("app_language_name", ""),
+        access_granted=False,
+        admin_mode=False,
+        once_key="paywall_view"
+    )
+    init_access_control_db()
+
     brand = settings["brand_name"]
-    price = settings["price_usd"]
+    base_price = float(str(settings.get("price_usd", "5")).replace(",", ".") or 5)
     payment_link = settings["payment_link"]
     support = settings["support_contact"]
 
@@ -6419,53 +7291,139 @@ def render_public_landing(settings):
     <div class="pay-hero">
       <h1>⚽ {brand}</h1>
       <p>
-        Plataforma de análisis educativo del Mundial 2026 con modelos de probabilidad,
-        Monte Carlo, mapa del torneo, seguimiento de precisión, clima, noticias y métricas de rendimiento.
+        Plataforma educativa de análisis deportivo para el Mundial 2026 con modelos estadísticos,
+        probabilidades, simulaciones, marcadores probables, mapa del torneo y seguimiento de precisión.
       </p>
-      <div class="price-pill">Acceso digital · USD ${price}</div>
+      <div class="price-pill">Acceso digital · USD ${base_price:.2f}</div>
       <div class="pay-grid">
-        <div class="pay-card"><b>🗺️ Mapa vivo</b><br>Grupos, favoritos y ruta proyectada.</div>
-        <div class="pay-card"><b>🎯 Precisión</b><br>Seguimiento acumulado de aciertos.</div>
-        <div class="pay-card"><b>🤖 Modelo ML</b><br>Poisson, Dixon-Coles, regresores y Monte Carlo.</div>
+        <div class="pay-card"><b>🗺️ Mapa del torneo</b><br>Grupos, favoritos y ruta proyectada.</div>
+        <div class="pay-card"><b>🎯 Precisión</b><br>Seguimiento acumulado de rendimiento.</div>
+        <div class="pay-card"><b>🤖 Modelo estadístico</b><br>Poisson, Dixon-Coles, regresores y Monte Carlo.</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
     st.info(
-        "Esta plataforma es de análisis deportivo y educativo. No es una casa de apuestas, "
-        "no garantiza resultados y no promueve apostar."
+        "Producto educativo de análisis deportivo. No procesa pagos de juego, no participa en actividades reguladas "
+        "y no garantiza resultados. Las probabilidades son estimaciones estadísticas."
     )
 
-    col_buy, col_code = st.columns([1, 1])
+    coupon_input = st.text_input("Cupón de descuento opcional", placeholder="Ej: BETA-TIKTOK-2026").strip().upper()
+    coupon = get_coupon(coupon_input) if coupon_input else None
+    final_price = float(coupon["price_usd"]) if coupon else base_price
+    if coupon:
+        st.success(f"Cupón aplicado: {coupon['code']} · Precio promocional: USD ${final_price:.2f}")
+        track_analytics_event("coupon_applied", language=st.session_state.get("app_language_name", ""), details={"coupon": coupon["code"], "price_usd": final_price})
+        log_access_event("coupon_applied", details={"code": coupon["code"], "price_usd": final_price})
+    elif coupon_input:
+        st.warning("Cupón no válido, inactivo o sin usos disponibles.")
 
-    with col_buy:
-        st.subheader("1. Compra el acceso")
+    tab_trial, tab_paid, tab_buy = st.tabs(["🎁 Probar gratis", "🔐 Ya soy cliente", "💳 Comprar acceso"])
+
+    with tab_trial:
+        st.subheader("Prueba gratuita")
+        st.caption(
+            "La prueba gratuita se habilita una sola vez por correo. "
+            "Recibirás un código dinámico que vence en 10 minutos."
+        )
+        trial_email = st.text_input("Correo para recibir el código gratuito", key="trial_email")
+        col_send_trial, col_verify_trial = st.columns(2)
+
+        with col_send_trial:
+            if st.button("Enviar código de prueba", use_container_width=True):
+                email = normalize_email(trial_email)
+                ok, msg = create_or_get_trial_customer(email, coupon_input)
+                if ok:
+                    token = generate_login_token(email, purpose="trial")
+                    sent, email_msg = send_login_token_email(email, token, purpose="trial")
+                    if sent:
+                        st.success("Código enviado. Revisa tu correo.")
+                    else:
+                        st.error(email_msg)
+                    track_analytics_event("trial_code_requested", language=st.session_state.get("app_language_name", ""), details={"email_configured": sent})
+                else:
+                    st.error(msg)
+
+        with col_verify_trial:
+            trial_code = st.text_input("Código recibido", type="password", key="trial_code")
+            if st.button("Entrar con prueba", use_container_width=True):
+                email = normalize_email(trial_email)
+                ok, msg = validate_login_token(email, trial_code)
+                if ok:
+                    st.session_state["access_granted"] = True
+                    st.session_state["access_email"] = email
+                    st.session_state["access_type"] = "trial"
+                    track_analytics_event("access_granted_trial", language=st.session_state.get("app_language_name", ""), access_granted=True)
+                    st.success("Acceso de prueba aprobado.")
+                    st.rerun()
+                else:
+                    track_analytics_event("access_denied_trial", language=st.session_state.get("app_language_name", ""))
+                    st.error(msg)
+
+    with tab_paid:
+        st.subheader("Ingreso de cliente")
+        st.caption(
+            "Cada inicio de sesión genera un código nuevo enviado al correo registrado. "
+            "El código anterior deja de servir después de usarlo o al vencerse."
+        )
+        paid_email = st.text_input("Correo registrado", key="paid_login_email")
+        col_send_paid, col_verify_paid = st.columns(2)
+
+        with col_send_paid:
+            if st.button("Enviar código de ingreso", use_container_width=True):
+                email = normalize_email(paid_email)
+                customer = get_customer(email)
+                if customer and customer.get("status") == "paid":
+                    token = generate_login_token(email, purpose="paid")
+                    sent, email_msg = send_login_token_email(email, token, purpose="paid")
+                    if sent:
+                        st.success("Código enviado. Revisa tu correo.")
+                    else:
+                        st.error(email_msg)
+                    track_analytics_event("paid_login_code_requested", language=st.session_state.get("app_language_name", ""), details={"email_configured": sent})
+                else:
+                    st.error("Este correo no está registrado como cliente pagado. Si ya compraste, espera confirmación o contacta soporte.")
+                    log_access_event("paid_login_not_registered", email=email)
+
+        with col_verify_paid:
+            paid_code = st.text_input("Código de ingreso", type="password", key="paid_login_code")
+            if st.button("Entrar como cliente", use_container_width=True):
+                email = normalize_email(paid_email)
+                customer = get_customer(email)
+                if not customer or customer.get("status") != "paid":
+                    st.error("Correo no registrado como cliente pagado.")
+                else:
+                    ok, msg = validate_login_token(email, paid_code)
+                    if ok:
+                        st.session_state["access_granted"] = True
+                        st.session_state["access_email"] = email
+                        st.session_state["access_type"] = "paid"
+                        track_analytics_event("access_granted_paid", language=st.session_state.get("app_language_name", ""), access_granted=True)
+                        st.success("Acceso de cliente aprobado.")
+                        st.rerun()
+                    else:
+                        track_analytics_event("access_denied_paid", language=st.session_state.get("app_language_name", ""))
+                        st.error(msg)
+
+    with tab_buy:
+        st.subheader("Comprar acceso")
+        st.write(f"Precio actual: **USD ${final_price:.2f}**")
+        if coupon:
+            st.caption(f"Cupón aplicado: {coupon['code']}. Debes usar este mismo cupón al momento de solicitar/confirmar tu acceso.")
         if payment_link:
-            if st.button("Registrar intención de compra", use_container_width=True, help="Cuenta el clic y muestra el botón de checkout."):
-                track_analytics_event("payment_intent_click", language=st.session_state.get("app_language_name", ""), access_granted=False, admin_mode=False)
-                st.info("Ahora abre el checkout seguro con el botón de abajo.")
-            st.link_button("Comprar acceso", payment_link, type="primary", use_container_width=True)
+            if st.button("Registrar intención de compra", use_container_width=True, help="Cuenta el clic y muestra el botón de pago."):
+                track_analytics_event("payment_intent_click", language=st.session_state.get("app_language_name", ""), access_granted=False, admin_mode=False, details={"price_usd": final_price, "coupon": coupon_input})
+                st.info("Abre el enlace de pago y luego envía tu correo para activar el acceso.")
+            st.link_button("Abrir enlace de pago", payment_link, type="primary", use_container_width=True)
         else:
-            st.warning(
-                "Aún no configuraste PAYMENT_LINK. Cuando tengas tu link de pago, agrégalo en Secrets."
-            )
+            st.warning("Aún no configuraste PAYMENT_LINK. Puedes vender manualmente y registrar el correo desde el panel admin.")
 
+        st.caption(
+            "Después de verificar el pago, el administrador registra tu correo. "
+            "A partir de ahí, cada ingreso se valida con un código dinámico enviado a tu correo."
+        )
         if support:
             st.caption(f"Soporte: {support}")
-
-    with col_code:
-        st.subheader("2. Ingresa tu código")
-        code_input = st.text_input("Código de acceso", type="password", placeholder="Ej: MUNDIAL-XXXX")
-        if st.button("Entrar", use_container_width=True):
-            valid_codes = settings["access_codes"]
-            if code_input.strip() and code_input.strip() in valid_codes:
-                st.session_state["access_granted"] = True
-                track_analytics_event("access_granted", language=st.session_state.get("app_language_name", ""), access_granted=True, admin_mode=False)
-                st.success("Acceso aprobado. Cargando plataforma...")
-                st.rerun()
-            else:
-                track_analytics_event("access_denied", language=st.session_state.get("app_language_name", ""), access_granted=False, admin_mode=False)
-                st.error("Código inválido. Revisa el código recibido después del pago.")
 
     with st.expander("Privacy / Privacidad y pagos"):
         render_privacy_policy_section(compact=True)
@@ -6473,7 +7431,6 @@ def render_public_landing(settings):
             "Nota: los procesadores de pago y proveedores de hosting pueden tener sus propios registros técnicos "
             "y políticas de privacidad. Esta política describe la analítica interna de la app."
         )
-
 
 
 # ============================================================
@@ -6493,7 +7450,7 @@ TRANSLATIONS = {
         "author": "Autor",
         "objective": "Objetivo",
         "objective_text": "estimar probabilidades, goles esperados y marcadores probables con datos recientes.",
-        "caption": "Modelo educativo: estima probabilidades y marcadores probables. No usa cuotas ni servicios de apuestas.",
+        "caption": "Modelo educativo: estima probabilidades y marcadores probables. No procesa pagos de juego ni actividades reguladas.",
         "language": "Idioma",
         "settings": "Configuración",
         "api_fixed": "API-Football configurada desde Secrets. La clave no se muestra públicamente.",
@@ -6538,7 +7495,7 @@ TRANSLATIONS = {
         "author": "Author",
         "objective": "Objective",
         "objective_text": "estimate probabilities, expected goals and likely scores using recent data.",
-        "caption": "Educational model: estimates probabilities and likely scores. It does not use betting odds or gambling services.",
+        "caption": "Educational model: estimates probabilities and likely scores. It does not process regulated gaming payments or regulated gaming activity.",
         "language": "Language",
         "settings": "Settings",
         "api_fixed": "API-Football is configured from Secrets. The key is not publicly displayed.",
@@ -6583,7 +7540,7 @@ TRANSLATIONS = {
         "author": "Autor",
         "objective": "Objetivo",
         "objective_text": "estimar probabilidades, gols esperados e placares prováveis com dados recentes.",
-        "caption": "Modelo educacional: estima probabilidades e placares prováveis. Não usa odds nem serviços de apostas.",
+        "caption": "Modelo educacional: estima probabilidades e placares prováveis. Não processa pagamentos de jogos regulados nem atividades reguladas.",
         "language": "Idioma",
         "settings": "Configuração",
         "api_fixed": "API-Football configurada via Secrets. A chave não é exibida publicamente.",
@@ -6834,11 +7791,21 @@ def streamlit_app():
         admin_mode=admin_mode,
         details={
             "require_access": access_settings.get("require_access", False),
-            "privacy_version": "V33_PRIVACIDAD_ANALITICA",
+            "privacy_version": "V35_ACCESO_CUPONES_COMPLIANCE",
             "analytics_scope": "anonymous_events_only"
         },
         once_key="session_start"
     )
+
+    # Envío automático del reporte de analítica si ya pasó el intervalo configurado.
+    # En Streamlit Cloud esto se evalúa cuando la app recibe una visita o se ejecuta.
+    try:
+        maybe_send_hourly_analytics_email()
+    except Exception:
+        pass
+
+    # Disuasión visual ante copias no autorizadas. No puede impedir capturas del sistema operativo.
+    render_screen_protection()
 
     current_year = datetime.today().year
     default_min_year = max(1980, current_year - 8)
