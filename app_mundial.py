@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V38_COP_SIN_AUTOR"
+MODEL_VERSION = "V39_CUPONES_REPORTES_4H"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -6269,7 +6269,7 @@ def analytics_email_settings():
     return {
         "enabled": enabled,
         "to": str(get_config_value("ANALYTICS_EMAIL_TO", "") or "").strip(),
-        "interval_minutes": max(15, _int_secret("ANALYTICS_EMAIL_INTERVAL_MINUTES", 60)),
+        "interval_minutes": max(15, _int_secret("ANALYTICS_EMAIL_INTERVAL_MINUTES", 240)),
         "smtp_host": str(get_config_value("SMTP_HOST", "") or "").strip(),
         "smtp_port": _int_secret("SMTP_PORT", 465),
         "smtp_user": str(get_config_value("SMTP_USER", "") or "").strip(),
@@ -6300,6 +6300,169 @@ def analytics_email_ready(settings=None):
     settings = settings or analytics_email_settings()
     required = ["to", "smtp_host", "smtp_user", "smtp_password"]
     return settings.get("enabled", False) and all(str(settings.get(k, "")).strip() for k in required)
+
+
+
+
+def load_coupon_usage_report():
+    """
+    Reporte por cupón:
+    - cuántos usuarios registraron prueba o compra con cada cupón,
+    - cuántos clientes pagados quedaron asociados a cada cupón,
+    - cuántos ingresos a la app suman esos usuarios,
+    - cuántos pagos verificados llegaron con cada cupón.
+    """
+    init_access_control_db()
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            coupons = pd.read_sql_query(
+                """
+                SELECT
+                    code AS coupon_code,
+                    price_usd AS coupon_price,
+                    active,
+                    max_uses,
+                    uses AS coupon_uses_recorded,
+                    created_at,
+                    notes
+                FROM coupons
+                """,
+                con
+            )
+            customers = pd.read_sql_query(
+                """
+                SELECT
+                    email,
+                    status,
+                    coupon_code,
+                    COALESCE(total_logins, 0) AS total_logins,
+                    last_login_at,
+                    created_at
+                FROM customers
+                WHERE coupon_code IS NOT NULL AND TRIM(coupon_code) <> ''
+                """,
+                con
+            )
+            payments = pd.read_sql_query(
+                """
+                SELECT
+                    coupon_code,
+                    COUNT(*) AS pagos_verificados,
+                    COALESCE(SUM(amount), 0) AS valor_verificado
+                FROM payments
+                WHERE coupon_code IS NOT NULL AND TRIM(coupon_code) <> ''
+                GROUP BY coupon_code
+                """,
+                con
+            )
+            access_events = pd.read_sql_query(
+                """
+                SELECT ts, event_type, details
+                FROM access_events
+                WHERE event_type = 'coupon_applied'
+                ORDER BY ts DESC
+                """,
+                con
+            )
+    except Exception:
+        return pd.DataFrame()
+
+    for df in [coupons, customers, payments]:
+        if not df.empty and "coupon_code" in df.columns:
+            df["coupon_code"] = df["coupon_code"].astype(str).str.strip().str.upper()
+
+    if coupons.empty:
+        coupons = pd.DataFrame(columns=["coupon_code", "coupon_price", "active", "max_uses", "coupon_uses_recorded", "created_at", "notes"])
+
+    if customers.empty:
+        customer_summary = pd.DataFrame(columns=[
+            "coupon_code", "usuarios_con_cupon", "clientes_pagados", "pruebas_gratis",
+            "ingresos_app_con_cupon", "ultimo_ingreso"
+        ])
+    else:
+        customers["status"] = customers["status"].astype(str).str.lower()
+        customer_summary = (
+            customers.groupby("coupon_code")
+            .agg(
+                usuarios_con_cupon=("email", "nunique"),
+                clientes_pagados=("status", lambda s: int((s == "paid").sum())),
+                pruebas_gratis=("status", lambda s: int((s == "trial").sum())),
+                ingresos_app_con_cupon=("total_logins", "sum"),
+                ultimo_ingreso=("last_login_at", "max"),
+            )
+            .reset_index()
+        )
+
+    if payments.empty:
+        payments = pd.DataFrame(columns=["coupon_code", "pagos_verificados", "valor_verificado"])
+
+    # Veces que se escribió/aplicó el cupón en pantalla, aunque no necesariamente compró.
+    applied_summary = pd.DataFrame(columns=["coupon_code", "veces_escrito_en_pantalla"])
+    if access_events is not None and not access_events.empty:
+        parsed = []
+        for _, row in access_events.iterrows():
+            try:
+                details = json.loads(row.get("details") or "{}")
+                code = str(details.get("code", "")).strip().upper()
+                if code:
+                    parsed.append(code)
+            except Exception:
+                pass
+        if parsed:
+            applied_summary = (
+                pd.DataFrame({"coupon_code": parsed})
+                .groupby("coupon_code")
+                .size()
+                .reset_index(name="veces_escrito_en_pantalla")
+            )
+
+    report = coupons.merge(customer_summary, on="coupon_code", how="outer")
+    report = report.merge(payments, on="coupon_code", how="left")
+    report = report.merge(applied_summary, on="coupon_code", how="left")
+
+    numeric_cols = [
+        "coupon_price", "active", "max_uses", "coupon_uses_recorded", "usuarios_con_cupon",
+        "clientes_pagados", "pruebas_gratis", "ingresos_app_con_cupon",
+        "pagos_verificados", "valor_verificado", "veces_escrito_en_pantalla"
+    ]
+    for col in numeric_cols:
+        if col in report.columns:
+            report[col] = pd.to_numeric(report[col], errors="coerce").fillna(0)
+
+    if "coupon_code" in report.columns:
+        report["coupon_code"] = report["coupon_code"].fillna("").astype(str)
+        report = report[report["coupon_code"].str.strip() != ""]
+
+    ordered = [
+        "coupon_code", "coupon_price", "active", "max_uses", "coupon_uses_recorded",
+        "veces_escrito_en_pantalla", "usuarios_con_cupon", "clientes_pagados",
+        "pruebas_gratis", "ingresos_app_con_cupon", "pagos_verificados",
+        "valor_verificado", "ultimo_ingreso", "created_at", "notes"
+    ]
+    ordered = [c for c in ordered if c in report.columns]
+    return report[ordered].sort_values(["clientes_pagados", "ingresos_app_con_cupon", "usuarios_con_cupon"], ascending=False)
+
+
+def coupon_report_as_text(max_rows=20):
+    df_coupon = load_coupon_usage_report()
+    if df_coupon is None or df_coupon.empty:
+        return "Sin datos de cupones todavía."
+
+    lines = []
+    for _, r in df_coupon.head(max_rows).iterrows():
+        code = r.get("coupon_code", "")
+        users = int(r.get("usuarios_con_cupon", 0))
+        paid = int(r.get("clientes_pagados", 0))
+        trials = int(r.get("pruebas_gratis", 0))
+        logins = int(r.get("ingresos_app_con_cupon", 0))
+        payments = int(r.get("pagos_verificados", 0))
+        applied = int(r.get("veces_escrito_en_pantalla", 0))
+        value = float(r.get("valor_verificado", 0) or 0)
+        lines.append(
+            f"- {code}: usuarios {users}, clientes pagados {paid}, pruebas {trials}, "
+            f"ingresos a la app {logins}, pagos verificados {payments}, escrito en pantalla {applied}, valor verificado {value:,.0f}"
+        )
+    return "\n".join(lines)
 
 
 def build_analytics_email_body(df=None):
@@ -6358,6 +6521,8 @@ No incluye IP, nombres, correos de usuarios, tarjetas, contraseñas, API keys ni
             ]
         )
 
+    coupon_text = coupon_report_as_text()
+
     last24_sessions = 0
     last24_events = 0
     last24_paywall = 0
@@ -6390,6 +6555,9 @@ EVENTOS POR TIPO
 
 VISITAS / ACCESOS POR DÍA
 {daily_text}
+
+REPORTE POR CUPÓN
+{coupon_text}
 
 ÚLTIMOS EVENTOS
 {recent_text}
@@ -6429,6 +6597,16 @@ def send_analytics_email_report(force=False):
                 maintype="text",
                 subtype="csv",
                 filename=f"analytics_visitas_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+            )
+
+        coupon_df = load_coupon_usage_report()
+        if coupon_df is not None and not coupon_df.empty:
+            coupon_csv = coupon_df.to_csv(index=False).encode("utf-8")
+            msg.add_attachment(
+                coupon_csv,
+                maintype="text",
+                subtype="csv",
+                filename=f"reporte_cupones_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
             )
     except Exception:
         pass
@@ -6477,7 +6655,7 @@ def maybe_send_hourly_analytics_email():
     """
     Envía automáticamente si ya pasó el intervalo configurado.
     En Streamlit esto se evalúa cuando la app recibe una visita/ejecución.
-    Para envío exacto cada hora sin visitas se necesita un cron externo que despierte la app.
+    Para envío exacto cada 4 horas sin visitas se necesita un cron externo que despierte la app.
     """
     try:
         settings = analytics_email_settings()
@@ -6520,7 +6698,7 @@ def render_analytics_email_controls():
     with st.expander("Configuración necesaria en Secrets"):
         st.code("""ANALYTICS_EMAIL_ENABLED = "true"
 ANALYTICS_EMAIL_TO = "nivisyrafael@gmail.com"
-ANALYTICS_EMAIL_INTERVAL_MINUTES = "60"
+ANALYTICS_EMAIL_INTERVAL_MINUTES = "240"
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = "465"
@@ -6530,7 +6708,7 @@ SMTP_FROM = "Mundial Predictor Pro <tu_correo@gmail.com>"
 """, language="toml")
         st.caption(
             "Para Gmail debes usar una contraseña de aplicación, no tu contraseña normal. "
-            "El envío automático ocurre cuando la app se ejecuta; para exactitud cada hora se recomienda un ping externo."
+            "El envío automático ocurre cuando la app se ejecuta; para exactitud cada 4 horas se recomienda un ping externo."
         )
 
     col_send, col_auto = st.columns(2)
@@ -7465,7 +7643,7 @@ def render_access_admin_dashboard():
         with c2:
             paid_coupon = st.text_input("Cupón usado", key="admin_paid_coupon")
         with c3:
-            paid_price = st.number_input("Precio USD", min_value=0.0, value=5.0, step=0.5, key="admin_paid_price")
+            paid_price = st.number_input("Precio COP", min_value=0.0, value=19900.0, step=1000.0, key="admin_paid_price")
         paid_notes = st.text_input("Notas internas", key="admin_paid_notes")
         if st.button("Guardar cliente pagado", use_container_width=True):
             ok, msg = register_paid_customer(paid_email, paid_coupon, paid_price, paid_notes)
@@ -7500,7 +7678,7 @@ def render_access_admin_dashboard():
         with c1:
             coupon_code = st.text_input("Código cupón", value="BETA-TIKTOK-2026", key="admin_coupon_code")
         with c2:
-            coupon_price = st.number_input("Precio con cupón USD", min_value=0.0, value=4.0, step=0.5, key="admin_coupon_price")
+            coupon_price = st.number_input("Precio con cupón COP", min_value=0.0, value=15900.0, step=1000.0, key="admin_coupon_price")
         with c3:
             coupon_uses = st.number_input("Usos máximos", min_value=1, value=200, step=10, key="admin_coupon_uses")
         coupon_notes = st.text_input("Notas cupón", value="Campaña promocional", key="admin_coupon_notes")
@@ -7515,6 +7693,24 @@ def render_access_admin_dashboard():
             with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
                 df_coupons = pd.read_sql_query("SELECT * FROM coupons ORDER BY created_at DESC", con)
             st.dataframe(safe_streamlit_df(df_coupons), use_container_width=True, hide_index=True)
+
+            st.markdown("#### Uso de cupones")
+            st.caption(
+                "Muestra cuántos usuarios quedaron asociados a cada cupón, cuántos son clientes pagados "
+                "y cuántos ingresos a la app suman esos usuarios."
+            )
+            df_coupon_report = load_coupon_usage_report()
+            if df_coupon_report is not None and not df_coupon_report.empty:
+                st.dataframe(safe_streamlit_df(df_coupon_report), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Descargar reporte de cupones CSV",
+                    data=df_coupon_report.to_csv(index=False).encode("utf-8"),
+                    file_name="reporte_cupones.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.info("Todavía no hay uso de cupones registrado.")
         except Exception as e:
             st.error(f"No se pudo cargar cupones: {e}")
 
@@ -7700,7 +7896,7 @@ def render_public_landing(settings):
         "y no garantiza resultados. Las probabilidades son estimaciones estadísticas."
     )
 
-    coupon_input = st.text_input("Cupón de descuento opcional", placeholder="Ej: BETA-TIKTOK-2026").strip().upper()
+    coupon_input = st.text_input("Cupón de descuento opcional", placeholder="Ingresa tu cupón").strip().upper()
     coupon = get_coupon(coupon_input) if coupon_input else None
     final_price = coupon_price if coupon else base_price
     if coupon:
@@ -8236,7 +8432,7 @@ def streamlit_app():
         admin_mode=admin_mode,
         details={
             "require_access": access_settings.get("require_access", False),
-            "privacy_version": "V38_COP_SIN_AUTOR",
+            "privacy_version": "V39_CUPONES_REPORTES_4H",
             "analytics_scope": "anonymous_events_only"
         },
         once_key="session_start"
