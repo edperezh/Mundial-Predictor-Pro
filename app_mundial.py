@@ -1,7 +1,6 @@
 
 # ============================================================
 # PREDICTOR MUNDIAL 2026 - MODELO EDUCATIVO DE ANALÍTICA FÚTBOL
-# Autor: generado para Spyder / Streamlit
 # Objetivo:
 #   - Descargar datos históricos de partidos internacionales.
 #   - Actualizar con datos del Mundial 2026 desde API-Football si tienes API key.
@@ -123,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V37_FIX_EMAIL_REGEX"
+MODEL_VERSION = "V38_COP_SIN_AUTOR"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -7069,9 +7068,9 @@ def mercadopago_settings():
     """
     return {
         "access_token": str(get_config_value("MERCADOPAGO_ACCESS_TOKEN", "") or "").strip(),
-        "currency": str(get_config_value("MERCADOPAGO_CURRENCY", "USD") or "USD").strip().upper(),
-        "base_price": float(str(get_config_value("MERCADOPAGO_BASE_PRICE", get_config_value("PRICE_USD", "5.00"))).replace(",", ".") or 5.0),
-        "coupon_price": float(str(get_config_value("MERCADOPAGO_COUPON_PRICE", "4.00")).replace(",", ".") or 4.0),
+        "currency": str(get_config_value("MERCADOPAGO_CURRENCY", "COP") or "COP").strip().upper(),
+        "base_price": float(str(get_config_value("MERCADOPAGO_BASE_PRICE", "19900")).replace(",", ".") or 19900),
+        "coupon_price": float(str(get_config_value("MERCADOPAGO_COUPON_PRICE", "15900")).replace(",", ".") or 15900),
         "public_url": str(get_config_value("APP_PUBLIC_URL", "https://predictor-mundial-2026-edp.streamlit.app/") or "").strip().rstrip("/"),
         "sandbox": str(get_config_value("MERCADOPAGO_SANDBOX", "false")).lower().strip() in ["1", "true", "yes", "si", "sí", "on"],
     }
@@ -7079,6 +7078,20 @@ def mercadopago_settings():
 
 def mercadopago_is_configured():
     return bool(mercadopago_settings().get("access_token"))
+
+
+def format_money(amount, currency="COP"):
+    """Formato simple para mostrar precios correctamente en la interfaz."""
+    try:
+        amount = float(amount)
+    except Exception:
+        amount = 0.0
+    currency = str(currency or "").upper()
+    if currency == "COP":
+        return f"COP ${amount:,.0f}".replace(",", ".")
+    if currency == "USD":
+        return f"USD ${amount:,.2f}"
+    return f"{currency} {amount:,.2f}"
 
 
 def get_query_params_safe():
@@ -7608,9 +7621,19 @@ def render_public_landing(settings):
     handle_mercadopago_return()
 
     brand = settings["brand_name"]
-    base_price = float(str(settings.get("price_usd", "5")).replace(",", ".") or 5)
     payment_link = settings["payment_link"]
     support = settings["support_contact"]
+
+    # La interfaz muestra la misma moneda que se usa en el checkout.
+    mp_cfg_for_display = mercadopago_settings()
+    if mercadopago_is_configured():
+        display_currency = mp_cfg_for_display["currency"]
+        base_price = float(mp_cfg_for_display["base_price"])
+        coupon_price = float(mp_cfg_for_display["coupon_price"])
+    else:
+        display_currency = "USD"
+        base_price = float(str(settings.get("price_usd", "5")).replace(",", ".") or 5)
+        coupon_price = 4.0
 
     st.markdown(f"""
     <style>
@@ -7663,7 +7686,7 @@ def render_public_landing(settings):
         Plataforma educativa de análisis deportivo para el Mundial 2026 con modelos estadísticos,
         probabilidades, simulaciones, marcadores probables, mapa del torneo y seguimiento de precisión.
       </p>
-      <div class="price-pill">Acceso digital · USD ${base_price:.2f}</div>
+      <div class="price-pill">Acceso digital · {format_money(base_price, display_currency)}</div>
       <div class="pay-grid">
         <div class="pay-card"><b>🗺️ Mapa del torneo</b><br>Grupos, favoritos y ruta proyectada.</div>
         <div class="pay-card"><b>🎯 Precisión</b><br>Seguimiento acumulado de rendimiento.</div>
@@ -7679,11 +7702,15 @@ def render_public_landing(settings):
 
     coupon_input = st.text_input("Cupón de descuento opcional", placeholder="Ej: BETA-TIKTOK-2026").strip().upper()
     coupon = get_coupon(coupon_input) if coupon_input else None
-    final_price = float(coupon["price_usd"]) if coupon else base_price
+    final_price = coupon_price if coupon else base_price
     if coupon:
-        st.success(f"Cupón aplicado: {coupon['code']} · Precio promocional: USD ${final_price:.2f}")
-        track_analytics_event("coupon_applied", language=st.session_state.get("app_language_name", ""), details={"coupon": coupon["code"], "price_usd": final_price})
-        log_access_event("coupon_applied", details={"code": coupon["code"], "price_usd": final_price})
+        st.success(f"Cupón aplicado: {coupon['code']} · Precio promocional: {format_money(final_price, display_currency)}")
+        track_analytics_event(
+            "coupon_applied",
+            language=st.session_state.get("app_language_name", ""),
+            details={"coupon": coupon["code"], "price": final_price, "currency": display_currency}
+        )
+        log_access_event("coupon_applied", details={"code": coupon["code"], "price": final_price, "currency": display_currency})
     elif coupon_input:
         st.warning("Cupón no válido, inactivo o sin usos disponibles.")
 
@@ -7776,9 +7803,9 @@ def render_public_landing(settings):
 
     with tab_buy:
         st.subheader("Comprar acceso")
-        st.write(f"Precio base: **USD ${base_price:.2f}**")
+        st.write(f"Precio base: **{format_money(base_price, display_currency)}**")
         if coupon:
-            st.success(f"Precio con cupón: **USD ${final_price:.2f}**")
+            st.success(f"Precio con cupón: **{format_money(final_price, display_currency)}**")
         st.caption(
             "El registro puede hacerse automáticamente si el pago vuelve aprobado desde Mercado Pago. "
             "Después, cada ingreso usa un código dinámico enviado al correo registrado."
@@ -7789,7 +7816,7 @@ def render_public_landing(settings):
             st.markdown("#### Pago automático con Mercado Pago")
             purchase_email = st.text_input("Correo del comprador", key="mp_purchase_email")
             mp_amount = mp_cfg["coupon_price"] if coupon else mp_cfg["base_price"]
-            st.caption(f"Precio en checkout: **{mp_cfg['currency']} {mp_amount:.2f}**")
+            st.caption(f"Precio en checkout: **{format_money(mp_amount, mp_cfg['currency'])}**")
 
             if st.button("Generar enlace de pago", type="primary", use_container_width=True):
                 email = normalize_email(purchase_email)
@@ -8175,7 +8202,7 @@ def streamlit_app():
             line-height: 1.12;
             margin-bottom: 0.2rem;
         }
-        .author-box {
+        .objective-box {
             padding: 0.75rem 1rem;
             border-radius: 14px;
             background: #f3f6ff;
@@ -8194,8 +8221,7 @@ def streamlit_app():
 
     st.markdown(f'<div class="main-title">⚽ {tr("main_title", lang)}</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="author-box"><b>{tr("author", lang)}:</b> Eder R Perez Herrera<br>'
-        f'<b>{tr("objective", lang)}:</b> {tr("objective_text", lang)}</div>',
+        f'<div class="objective-box"><b>{tr("objective", lang)}:</b> {tr("objective_text", lang)}</div>',
         unsafe_allow_html=True
     )
 
@@ -8210,7 +8236,7 @@ def streamlit_app():
         admin_mode=admin_mode,
         details={
             "require_access": access_settings.get("require_access", False),
-            "privacy_version": "V36_AUTO_REGISTRO_PAGO",
+            "privacy_version": "V38_COP_SIN_AUTOR",
             "analytics_scope": "anonymous_events_only"
         },
         once_key="session_start"
@@ -8266,7 +8292,7 @@ def streamlit_app():
             st.caption("Modo público: las predicciones usan el modelo oficial guardado. No reentrena ni muestra claves internas.")
 
         st.markdown("---")
-        st.markdown(f"**{tr('author', lang)}:** Eder R Perez Herrera")
+        st.caption("Mundial Predictor Pro")
 
     if admin_mode:
         st.markdown("### " + tr("execution_panel", lang))
