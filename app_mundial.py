@@ -19,6 +19,8 @@ import math
 import warnings
 import random
 import pickle
+import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -115,7 +117,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V31_ESTADIO_AUTOMATICO"
+MODEL_VERSION = "V33_PRIVACIDAD_ANALITICA"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -128,6 +130,7 @@ MODEL_DIR.mkdir(exist_ok=True)
 MODEL_ARTIFACT_PATH = MODEL_DIR / "modelo_oficial.pkl"
 MODEL_METADATA_PATH = MODEL_DIR / "metadata_modelo.json"
 WC_SNAPSHOT_FILE = DATA_DIR / "snapshot_mundial_2026.csv"
+ANALYTICS_DB_PATH = DATA_DIR / "analytics_visitas.sqlite"
 
 
 # La precisión acumulada del Mundial se empieza a medir desde este partido hacia adelante.
@@ -6011,6 +6014,315 @@ def get_config_value(key, default=""):
 
 
 
+
+
+# ============================================================
+# 10B. ANALÍTICA BÁSICA DE VISITAS
+# ============================================================
+
+def analytics_is_enabled():
+    """Permite activar/desactivar analítica básica desde Secrets."""
+    raw = str(get_config_value("ANALYTICS_ENABLED", "true")).lower().strip()
+    return raw in ["1", "true", "yes", "si", "sí", "on"]
+
+
+def init_analytics_db():
+    """Crea una base SQLite local para registrar eventos anónimos de uso."""
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        with sqlite3.connect(ANALYTICS_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS analytics_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    language TEXT,
+                    access_granted INTEGER DEFAULT 0,
+                    admin_mode INTEGER DEFAULT 0,
+                    details TEXT
+                )
+                """
+            )
+            con.execute("CREATE INDEX IF NOT EXISTS idx_analytics_date ON analytics_events(date)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_analytics_session ON analytics_events(session_id)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_analytics_event ON analytics_events(event_type)")
+            con.commit()
+        return True
+    except Exception:
+        return False
+
+
+def get_analytics_session_id():
+    """
+    Identificador anónimo por sesión de Streamlit.
+    No guarda IP, correo, nombre, API keys ni códigos ingresados.
+    """
+    if not STREAMLIT_OK:
+        return "no-streamlit"
+    if "analytics_session_id" not in st.session_state:
+        st.session_state["analytics_session_id"] = str(uuid.uuid4())
+    return st.session_state["analytics_session_id"]
+
+
+def track_analytics_event(event_type, language="", access_granted=False, admin_mode=False, details=None, once_key=None):
+    """
+    Registra un evento anónimo. Sirve para estimar:
+    - sesiones/visitas,
+    - visitas al paywall,
+    - accesos aprobados,
+    - uso del panel público/admin.
+
+    Nota: en Streamlit Community Cloud el almacenamiento local puede reiniciarse si la app se redeploya
+    o el contenedor se recrea. Para producción total se recomienda integrar una base externa.
+    """
+    try:
+        if not STREAMLIT_OK or not analytics_is_enabled():
+            return False
+
+        if once_key:
+            flag = f"analytics_once_{once_key}"
+            if st.session_state.get(flag):
+                return False
+            st.session_state[flag] = True
+
+        if not init_analytics_db():
+            return False
+
+        now = datetime.utcnow()
+        payload = details or {}
+        # Seguridad: no registrar secretos ni códigos de acceso.
+        safe_payload = {}
+        for k, v in payload.items():
+            lk = str(k).lower()
+            if any(s in lk for s in ["key", "secret", "token", "password", "code", "api"]):
+                continue
+            safe_payload[str(k)] = str(v)[:250]
+
+        with sqlite3.connect(ANALYTICS_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT INTO analytics_events
+                (ts, date, session_id, event_type, language, access_granted, admin_mode, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now.isoformat(timespec="seconds") + "Z",
+                    now.date().isoformat(),
+                    get_analytics_session_id(),
+                    str(event_type),
+                    str(language or ""),
+                    1 if access_granted else 0,
+                    1 if admin_mode else 0,
+                    json.dumps(safe_payload, ensure_ascii=False),
+                )
+            )
+            con.commit()
+        return True
+    except Exception:
+        return False
+
+
+def load_analytics_events(limit=None):
+    """Carga eventos de analítica para el panel administrador."""
+    try:
+        if not ANALYTICS_DB_PATH.exists():
+            return pd.DataFrame()
+        q = "SELECT ts, date, session_id, event_type, language, access_granted, admin_mode, details FROM analytics_events ORDER BY id DESC"
+        if limit:
+            q += f" LIMIT {int(limit)}"
+        with sqlite3.connect(ANALYTICS_DB_PATH, timeout=10) as con:
+            df = pd.read_sql_query(q, con)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def summarize_analytics(df):
+    """Resumen de visitas anónimas."""
+    if df is None or df.empty:
+        return {
+            "sessions": 0,
+            "events": 0,
+            "paywall_views": 0,
+            "access_granted": 0,
+            "admin_sessions": 0,
+            "days": 0,
+        }
+    return {
+        "sessions": int(df["session_id"].nunique()) if "session_id" in df else 0,
+        "events": int(len(df)),
+        "paywall_views": int((df.get("event_type") == "paywall_view").sum()) if "event_type" in df else 0,
+        "access_granted": int((df.get("event_type") == "access_granted").sum()) if "event_type" in df else 0,
+        "admin_sessions": int(df.loc[df.get("admin_mode", 0).astype(str).isin(["1", "True", "true"]), "session_id"].nunique()) if "admin_mode" in df and "session_id" in df else 0,
+        "days": int(df["date"].nunique()) if "date" in df else 0,
+    }
+
+
+def render_analytics_dashboard():
+    """Panel administrador de visitas y eventos básicos."""
+    st.subheader("📊 Analítica de visitas")
+    st.caption(
+        "Conteo anónimo de sesiones y eventos de la app. No registra IP, nombres, correos, tarjetas, contraseñas, "
+        "API keys ni códigos de acceso. Solo se guardan eventos anónimos por sesión. "
+        "En Streamlit Cloud el almacenamiento local puede reiniciarse con redeploys; para ventas grandes conviene conectar una base externa."
+    )
+
+    if not analytics_is_enabled():
+        st.warning("ANALYTICS_ENABLED está desactivado en Secrets.")
+        return
+
+    df = load_analytics_events()
+    if df.empty:
+        st.info("Aún no hay eventos registrados. Abre la app en incógnito o espera visitas reales.")
+        return
+
+    summary = summarize_analytics(df)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Sesiones anónimas", summary["sessions"])
+    c2.metric("Eventos totales", summary["events"])
+    c3.metric("Vistas paywall", summary["paywall_views"])
+    c4.metric("Accesos aprobados", summary["access_granted"])
+    c5.metric("Días registrados", summary["days"])
+
+    st.markdown("### Visitas por día")
+    daily = (
+        df[df["event_type"].isin(["session_start", "paywall_view"])]
+        .groupby(["date", "event_type"])["session_id"]
+        .nunique()
+        .reset_index(name="sesiones")
+    )
+    if not daily.empty:
+        pivot = daily.pivot(index="date", columns="event_type", values="sesiones").fillna(0).reset_index()
+        st.dataframe(safe_streamlit_df(pivot), use_container_width=True, hide_index=True)
+        chart_df = pivot.set_index("date")
+        st.line_chart(chart_df)
+    else:
+        st.info("Todavía no hay visitas suficientes para graficar.")
+
+    st.markdown("### Eventos por tipo")
+    event_counts = df.groupby("event_type").size().reset_index(name="cantidad").sort_values("cantidad", ascending=False)
+    st.dataframe(safe_streamlit_df(event_counts), use_container_width=True, hide_index=True)
+
+    st.markdown("### Últimos eventos")
+    show = df.head(300).copy()
+    if "session_id" in show.columns:
+        show["session_id"] = show["session_id"].map(lambda x: str(x)[:8] + "…")
+    st.dataframe(safe_streamlit_df(show), use_container_width=True, hide_index=True)
+
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Descargar analítica CSV",
+        data=csv,
+        file_name="analytics_visitas.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    with st.expander("Mantenimiento"):
+        st.write("Usa esto solo si quieres reiniciar el conteo durante pruebas.")
+        confirm = st.checkbox("Confirmo que quiero borrar la analítica local", key="confirm_clear_analytics")
+        if st.button("Borrar analítica local", disabled=not confirm, use_container_width=True):
+            try:
+                if ANALYTICS_DB_PATH.exists():
+                    ANALYTICS_DB_PATH.unlink()
+                st.success("Analítica local borrada. Se empezará a contar desde cero.")
+                try:
+                    st.rerun()
+                except Exception:
+                    pass
+            except Exception as e:
+                st.error(f"No se pudo borrar: {e}")
+
+
+
+def render_privacy_policy_section(compact=False):
+    """
+    Política de privacidad simple y visible para la app.
+    Enfocada en analítica anónima interna: no guarda IP, correos, nombres,
+    códigos escritos, contraseñas ni tarjetas dentro de la app.
+    """
+    if compact:
+        st.markdown("#### Privacy / Privacidad")
+    else:
+        st.subheader("🔒 Privacy / Privacidad")
+
+    try:
+        track_analytics_event(
+            "privacy_policy_view",
+            language=st.session_state.get("app_language_name", ""),
+            access_granted=bool(st.session_state.get("access_granted", False)),
+            admin_mode=bool(st.session_state.get("admin_mode", False)),
+            once_key="privacy_policy_view"
+        )
+    except Exception:
+        pass
+
+    st.info(
+        "Usamos analítica anónima para contar visitas y mejorar la plataforma. "
+        "No guardamos nombres, correos, tarjetas, contraseñas, API keys ni códigos ingresados dentro de la analítica interna."
+    )
+
+    st.markdown(
+        """
+### What we collect / Qué recopilamos
+
+Mundial Predictor Pro may collect anonymous usage events such as:
+
+- Session start / Inicio de sesión anónima
+- Paywall viewed / Vista de pantalla de acceso
+- Payment intent click / Clic de intención de compra
+- Access granted / Acceso aprobado
+- Access denied / Acceso rechazado
+- Admin login event / Evento de inicio de administrador
+- Date and time / Fecha y hora
+- Selected language / Idioma seleccionado
+- Public section viewed / Sección pública vista
+
+These events are used only to measure platform usage, improve the product, detect errors, and understand general activity.
+
+### What we do not store directly / Qué no guardamos directamente
+
+Inside the app analytics system, we do not store:
+
+- Names / nombres
+- Email addresses / correos electrónicos
+- Payment card information / tarjetas o datos de pago
+- Passwords / contraseñas
+- API keys / claves API
+- Access codes entered by users / códigos escritos por usuarios
+- Precise location / ubicación exacta
+- IP addresses / direcciones IP
+
+### Payments / Pagos
+
+Payments are processed by an external payment provider. Mundial Predictor Pro does not store credit card details, bank information, or payment credentials inside the app.
+
+### Access codes / Códigos de acceso
+
+Access codes are used only to validate access to the platform. The app does not store the exact code entered in the analytics log.
+
+### Purpose / Finalidad
+
+The information is used for:
+
+- Counting anonymous visits / contar visitas anónimas
+- Measuring paywall and access activity / medir actividad de acceso
+- Improving the platform / mejorar la plataforma
+- Detecting technical issues / detectar errores técnicos
+- Understanding which sections are used most / saber qué secciones se usan más
+
+### Sports analytics notice / Aviso de análisis deportivo
+
+Mundial Predictor Pro is an educational sports analytics platform. The probabilities shown are statistical estimates and do not guarantee match results. This platform is not betting advice.
+
+If you have questions about privacy or data handling, contact support.
+        """
+    )
+
+
 def parse_access_codes(raw_codes):
     if raw_codes is None:
         return []
@@ -6053,6 +6365,7 @@ def render_public_landing(settings):
     Pantalla de entrada para monetizar sin mostrar datos personales.
     Importante: no oculta identidad ante procesadores de pago, bancos o autoridades.
     """
+    track_analytics_event("paywall_view", language=st.session_state.get("app_language_name", ""), access_granted=False, admin_mode=False, once_key="paywall_view")
     brand = settings["brand_name"]
     price = settings["price_usd"]
     payment_link = settings["payment_link"]
@@ -6128,6 +6441,9 @@ def render_public_landing(settings):
     with col_buy:
         st.subheader("1. Compra el acceso")
         if payment_link:
+            if st.button("Registrar intención de compra", use_container_width=True, help="Cuenta el clic y muestra el botón de checkout."):
+                track_analytics_event("payment_intent_click", language=st.session_state.get("app_language_name", ""), access_granted=False, admin_mode=False)
+                st.info("Ahora abre el checkout seguro con el botón de abajo.")
             st.link_button("Comprar acceso", payment_link, type="primary", use_container_width=True)
         else:
             st.warning(
@@ -6144,16 +6460,18 @@ def render_public_landing(settings):
             valid_codes = settings["access_codes"]
             if code_input.strip() and code_input.strip() in valid_codes:
                 st.session_state["access_granted"] = True
+                track_analytics_event("access_granted", language=st.session_state.get("app_language_name", ""), access_granted=True, admin_mode=False)
                 st.success("Acceso aprobado. Cargando plataforma...")
                 st.rerun()
             else:
+                track_analytics_event("access_denied", language=st.session_state.get("app_language_name", ""), access_granted=False, admin_mode=False)
                 st.error("Código inválido. Revisa el código recibido después del pago.")
 
-    with st.expander("Aviso de privacidad y pagos"):
-        st.write(
-            "Puedes mostrar una marca comercial o nombre de proyecto en la página, pero los procesadores de pago "
-            "y entidades financieras requieren verificación de identidad. No se debe prometer anonimato financiero. "
-            "Cumple impuestos, términos del procesador y leyes aplicables."
+    with st.expander("Privacy / Privacidad y pagos"):
+        render_privacy_policy_section(compact=True)
+        st.caption(
+            "Nota: los procesadores de pago y proveedores de hosting pueden tener sus propios registros técnicos "
+            "y políticas de privacidad. Esta política describe la analítica interna de la app."
         )
 
 
@@ -6406,6 +6724,7 @@ def render_admin_login(lang="es"):
         if st.button("Entrar como admin", use_container_width=True, key="admin_login_btn"):
             if typed and typed.strip() == admin_code:
                 st.session_state["admin_mode"] = True
+                track_analytics_event("admin_login", language=st.session_state.get("app_language_name", ""), access_granted=True, admin_mode=True)
                 st.success("Administrador activo")
                 try:
                     st.rerun()
@@ -6508,6 +6827,18 @@ def streamlit_app():
 
     admin_mode = render_admin_login(lang)
     access_settings = enforce_access_gate(is_admin=admin_mode)
+    track_analytics_event(
+        "session_start",
+        language=lang,
+        access_granted=bool(st.session_state.get("access_granted", False)) or admin_mode or not access_settings.get("require_access", False),
+        admin_mode=admin_mode,
+        details={
+            "require_access": access_settings.get("require_access", False),
+            "privacy_version": "V33_PRIVACIDAD_ANALITICA",
+            "analytics_scope": "anonymous_events_only"
+        },
+        once_key="session_start"
+    )
 
     current_year = datetime.today().year
     default_min_year = max(1980, current_year - 8)
@@ -7052,7 +7383,7 @@ def streamlit_app():
     st.divider()
 
     if admin_mode:
-        tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
             tr("tabs_champion", lang),
             tr("tabs_map", lang),
             tr("tabs_precision", lang),
@@ -7060,13 +7391,16 @@ def streamlit_app():
             tr("tabs_confusion", lang),
             tr("tabs_corr", lang),
             tr("tabs_importance", lang),
-            tr("tabs_match_data", lang)
+            tr("tabs_match_data", lang),
+            "🔒 Privacidad",
+            "📊 Analítica"
         ])
     else:
-        tab0, tab1, tab2 = st.tabs([
+        tab0, tab1, tab2, tab_privacy = st.tabs([
             tr("tabs_champion", lang),
             tr("tabs_map", lang),
-            tr("tabs_precision", lang)
+            tr("tabs_precision", lang),
+            "🔒 Privacidad"
         ])
 
     with tab0:
@@ -7322,6 +7656,15 @@ def streamlit_app():
             ff = prediction["future_features"].T.reset_index()
             ff.columns = ["Variable", "Valor"]
             st.dataframe(safe_streamlit_df(ff), use_container_width=True, hide_index=True)
+
+        with tab8:
+            render_privacy_policy_section(compact=False)
+
+        with tab9:
+            render_analytics_dashboard()
+    else:
+        with tab_privacy:
+            render_privacy_policy_section(compact=False)
 
     st.divider()
     if admin_mode:
