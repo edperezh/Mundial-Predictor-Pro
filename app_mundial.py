@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V39_CUPONES_REPORTES_4H"
+MODEL_VERSION = "V40_TRIAL_5_CONSULTAS_PRECIOS"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -6873,6 +6873,30 @@ def init_access_control_db():
                 )
                 """
             )
+            try:
+                con.execute("ALTER TABLE customers ADD COLUMN trial_queries_used INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                con.execute("ALTER TABLE customers ADD COLUMN trial_max_queries INTEGER DEFAULT 5")
+            except Exception:
+                pass
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trial_queries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL,
+                    query_key TEXT NOT NULL,
+                    team_a TEXT,
+                    team_b TEXT,
+                    created_at TEXT NOT NULL,
+                    details TEXT,
+                    UNIQUE(email, query_key)
+                )
+                """
+            )
+
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS login_tokens (
@@ -6934,6 +6958,7 @@ def init_access_control_db():
             con.execute("CREATE INDEX IF NOT EXISTS idx_access_events_ts ON access_events(ts)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_access_events_email ON access_events(email)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_login_tokens_email ON login_tokens(email)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_trial_queries_email ON trial_queries(email)")
             con.commit()
         ensure_default_coupon()
         return True
@@ -6942,7 +6967,7 @@ def init_access_control_db():
 
 
 def ensure_default_coupon():
-    """Crea un cupón inicial para promoción de USD 5 a USD 4."""
+    """Crea un cupón inicial para promoción beta."""
     try:
         now = datetime.utcnow().isoformat(timespec="seconds")
         with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
@@ -6952,7 +6977,7 @@ def ensure_default_coupon():
                 (code, price_usd, discount_usd, active, max_uses, uses, expires_at, created_at, notes)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                ("BETA-TIKTOK-2026", 4.0, 1.0, 1, 200, 0, None, now, "Cupón promocional beta: precio USD 4")
+                ("BETA-TIKTOK-2026", 10900.0, 4000.0, 1, 200, 0, None, now, "Cupón promocional beta: precio COP 10.900")
             )
             con.commit()
     except Exception:
@@ -7084,38 +7109,190 @@ def get_customer(email):
         return None
 
 
+
+
+def get_trial_max_queries():
+    try:
+        return max(1, int(str(get_config_value("TRIAL_MAX_CONSULTAS", "5")).strip()))
+    except Exception:
+        return 5
+
+
+def normalize_match_query_key(team_a, team_b):
+    """
+    Usa una llave estable para que A vs B y B vs A cuenten como la misma consulta.
+    Así se evita gastar una consulta duplicada por invertir equipos.
+    """
+    a = str(team_a or "").strip()
+    b = str(team_b or "").strip()
+    pair = sorted([a, b])
+    return f"{pair[0]}__VS__{pair[1]}".lower()
+
+
+def get_trial_queries_used(email):
+    init_access_control_db()
+    email = normalize_email(email)
+    if not email:
+        return 0
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            row = con.execute(
+                "SELECT COUNT(*) FROM trial_queries WHERE email = ?",
+                (email,)
+            ).fetchone()
+        return int(row[0] if row else 0)
+    except Exception:
+        return 0
+
+
+def trial_query_exists(email, query_key):
+    init_access_control_db()
+    email = normalize_email(email)
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            row = con.execute(
+                "SELECT 1 FROM trial_queries WHERE email = ? AND query_key = ? LIMIT 1",
+                (email, query_key)
+            ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def sync_trial_queries_used(email):
+    email = normalize_email(email)
+    used = get_trial_queries_used(email)
+    max_q = get_trial_max_queries()
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                UPDATE customers
+                SET trial_queries_used = ?, trial_max_queries = ?, updated_at = ?
+                WHERE email = ?
+                """,
+                (used, max_q, datetime.utcnow().isoformat(timespec="seconds"), email)
+            )
+            con.commit()
+    except Exception:
+        pass
+    return used
+
+
+def register_trial_query(email, team_a, team_b, details=None):
+    init_access_control_db()
+    email = normalize_email(email)
+    query_key = normalize_match_query_key(team_a, team_b)
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT OR IGNORE INTO trial_queries
+                (email, query_key, team_a, team_b, created_at, details)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (email, query_key, str(team_a), str(team_b), now, json.dumps(details or {}, ensure_ascii=False))
+            )
+            con.commit()
+        used = sync_trial_queries_used(email)
+        log_access_event(
+            "trial_query_used",
+            email=email,
+            details={"team_a": team_a, "team_b": team_b, "used": used, "max": get_trial_max_queries()}
+        )
+        return True
+    except Exception:
+        return False
+
+
+def check_and_register_trial_query(team_a, team_b):
+    """
+    Para usuarios de prueba:
+    - permite máximo 5 consultas por correo,
+    - una consulta se define como un partido/equipos analizados,
+    - repetir el mismo partido no descuenta otra consulta.
+    """
+    if st.session_state.get("access_type") != "trial":
+        return True, "", 0, get_trial_max_queries()
+
+    email = normalize_email(st.session_state.get("access_email", ""))
+    if not is_valid_email(email):
+        return False, "No se encontró un correo válido para la prueba gratuita.", 0, get_trial_max_queries()
+
+    max_q = get_trial_max_queries()
+    query_key = normalize_match_query_key(team_a, team_b)
+
+    if trial_query_exists(email, query_key):
+        used = get_trial_queries_used(email)
+        return True, f"Consulta ya registrada para este partido. Prueba gratuita: {used}/{max_q} consultas usadas.", used, max_q
+
+    used_before = get_trial_queries_used(email)
+    if used_before >= max_q:
+        sync_trial_queries_used(email)
+        log_access_event("trial_limit_reached", email=email, details={"used": used_before, "max": max_q})
+        return (
+            False,
+            f"Ya usaste tus {max_q} consultas gratuitas con este correo. Para seguir analizando partidos, compra el acceso completo.",
+            used_before,
+            max_q
+        )
+
+    register_trial_query(email, team_a, team_b, details={"source": "match_analysis"})
+    used_after = get_trial_queries_used(email)
+    return True, f"Prueba gratuita: consulta {used_after}/{max_q} usada.", used_after, max_q
+
+
 def create_or_get_trial_customer(email, coupon_code=""):
     """
     Crea una prueba gratuita por correo si no ha sido usada.
-    La prueba no pretende ser infalible por dispositivo; es control por correo.
+    La prueba permite hasta TRIAL_MAX_CONSULTAS análisis de partidos por correo.
     """
     init_access_control_db()
     email = normalize_email(email)
     if not is_valid_email(email):
         return False, "Correo inválido."
+
+    max_q = get_trial_max_queries()
     current = get_customer(email)
-    if current and int(current.get("trial_used", 0)) == 1 and current.get("status") != "paid":
-        log_access_event("trial_rejected_already_used", email=email)
-        return False, "Este correo ya usó la prueba gratuita. Para seguir usando la app, compra el acceso."
+
     if current and current.get("status") == "paid":
         return True, "Este correo ya tiene acceso pagado. Solicita tu código de ingreso."
+
+    used = get_trial_queries_used(email)
+    if used >= max_q:
+        sync_trial_queries_used(email)
+        log_access_event("trial_code_rejected_limit_reached", email=email, details={"used": used, "max": max_q})
+        return False, f"Este correo ya usó sus {max_q} consultas gratuitas. Para seguir usando la app, compra el acceso."
 
     now = datetime.utcnow().isoformat(timespec="seconds")
     try:
         with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
             con.execute(
                 """
-                INSERT OR IGNORE INTO customers
-                (email, status, trial_used, coupon_code, price_usd, notes, created_at, updated_at)
-                VALUES (?, 'trial', 1, ?, 0, 'Prueba gratuita inicial', ?, ?)
+                INSERT INTO customers
+                (email, status, trial_used, trial_queries_used, trial_max_queries, coupon_code, price_usd, notes, created_at, updated_at)
+                VALUES (?, 'trial', 1, ?, ?, ?, 0, 'Prueba gratuita con límite de consultas', ?, ?)
+                ON CONFLICT(email) DO UPDATE SET
+                    trial_used=1,
+                    trial_queries_used=COALESCE(trial_queries_used, ?),
+                    trial_max_queries=?,
+                    coupon_code=CASE
+                        WHEN customers.coupon_code IS NULL OR TRIM(customers.coupon_code) = ''
+                        THEN excluded.coupon_code
+                        ELSE customers.coupon_code
+                    END,
+                    updated_at=excluded.updated_at
                 """,
-                (email, str(coupon_code or "").strip().upper(), now, now)
+                (email, used, max_q, str(coupon_code or "").strip().upper(), now, now, used, max_q)
             )
             con.commit()
-        log_access_event("trial_customer_created", email=email)
-        return True, "Prueba gratuita creada. Revisa tu correo para ingresar el código."
+        sync_trial_queries_used(email)
+        log_access_event("trial_customer_created_or_reused", email=email, details={"used": used, "max": max_q})
+        return True, f"Prueba gratuita activa. Tienes {max_q - used} consultas disponibles."
     except Exception as e:
         return False, str(e)[:160]
+
 
 
 def generate_login_token(email, purpose="trial"):
@@ -7247,8 +7424,8 @@ def mercadopago_settings():
     return {
         "access_token": str(get_config_value("MERCADOPAGO_ACCESS_TOKEN", "") or "").strip(),
         "currency": str(get_config_value("MERCADOPAGO_CURRENCY", "COP") or "COP").strip().upper(),
-        "base_price": float(str(get_config_value("MERCADOPAGO_BASE_PRICE", "19900")).replace(",", ".") or 19900),
-        "coupon_price": float(str(get_config_value("MERCADOPAGO_COUPON_PRICE", "15900")).replace(",", ".") or 15900),
+        "base_price": float(str(get_config_value("MERCADOPAGO_BASE_PRICE", "14900")).replace(",", ".") or 14900),
+        "coupon_price": float(str(get_config_value("MERCADOPAGO_COUPON_PRICE", "10900")).replace(",", ".") or 10900),
         "public_url": str(get_config_value("APP_PUBLIC_URL", "https://predictor-mundial-2026-edp.streamlit.app/") or "").strip().rstrip("/"),
         "sandbox": str(get_config_value("MERCADOPAGO_SANDBOX", "false")).lower().strip() in ["1", "true", "yes", "si", "sí", "on"],
     }
@@ -7643,7 +7820,7 @@ def render_access_admin_dashboard():
         with c2:
             paid_coupon = st.text_input("Cupón usado", key="admin_paid_coupon")
         with c3:
-            paid_price = st.number_input("Precio COP", min_value=0.0, value=19900.0, step=1000.0, key="admin_paid_price")
+            paid_price = st.number_input("Precio COP", min_value=0.0, value=14900.0, step=1000.0, key="admin_paid_price")
         paid_notes = st.text_input("Notas internas", key="admin_paid_notes")
         if st.button("Guardar cliente pagado", use_container_width=True):
             ok, msg = register_paid_customer(paid_email, paid_coupon, paid_price, paid_notes)
@@ -7655,7 +7832,7 @@ def render_access_admin_dashboard():
         try:
             with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
                 df_customers = pd.read_sql_query(
-                    "SELECT email, status, trial_used, coupon_code, price_usd, created_at, last_login_at, total_logins, notes FROM customers ORDER BY updated_at DESC",
+                    "SELECT email, status, trial_used, COALESCE(trial_queries_used, 0) AS trial_queries_used, COALESCE(trial_max_queries, 5) AS trial_max_queries, coupon_code, price_usd, created_at, last_login_at, total_logins, notes FROM customers ORDER BY updated_at DESC",
                     con
                 )
             if not df_customers.empty:
@@ -7678,7 +7855,7 @@ def render_access_admin_dashboard():
         with c1:
             coupon_code = st.text_input("Código cupón", value="BETA-TIKTOK-2026", key="admin_coupon_code")
         with c2:
-            coupon_price = st.number_input("Precio con cupón COP", min_value=0.0, value=15900.0, step=1000.0, key="admin_coupon_price")
+            coupon_price = st.number_input("Precio con cupón COP", min_value=0.0, value=10900.0, step=1000.0, key="admin_coupon_price")
         with c3:
             coupon_uses = st.number_input("Usos máximos", min_value=1, value=200, step=10, key="admin_coupon_uses")
         coupon_notes = st.text_input("Notas cupón", value="Campaña promocional", key="admin_coupon_notes")
@@ -7915,7 +8092,7 @@ def render_public_landing(settings):
     with tab_trial:
         st.subheader("Prueba gratuita")
         st.caption(
-            "La prueba gratuita se habilita una sola vez por correo. "
+            "La prueba gratuita permite 5 consultas por correo. "
             "Recibirás un código dinámico que vence en 10 minutos."
         )
         trial_email = st.text_input("Correo para recibir el código gratuito", key="trial_email")
@@ -8432,7 +8609,7 @@ def streamlit_app():
         admin_mode=admin_mode,
         details={
             "require_access": access_settings.get("require_access", False),
-            "privacy_version": "V39_CUPONES_REPORTES_4H",
+            "privacy_version": "V40_TRIAL_5_CONSULTAS_PRECIOS",
             "analytics_scope": "anonymous_events_only"
         },
         once_key="session_start"
@@ -8710,6 +8887,17 @@ def streamlit_app():
                 "y Canada en Canada reciben ventaja de anfitrión. Los demás equipos no reciben ventaja de casa."
             )
         )
+
+    # Límite de consultas gratuitas por correo.
+    if not admin_mode and st.session_state.get("access_type") == "trial":
+        trial_ok, trial_msg, trial_used, trial_max = check_and_register_trial_query(team_a, team_b)
+        if trial_ok:
+            st.info(trial_msg)
+        else:
+            st.error(trial_msg)
+            st.markdown("### Compra el acceso completo")
+            st.write("Con el acceso completo puedes seguir consultando partidos sin el límite de prueba gratuita.")
+            st.stop()
 
     # Variables avanzadas automáticas desde internet y calendario interno gratuito.
     detected_fixture = find_internal_fixture(team_a, team_b)
