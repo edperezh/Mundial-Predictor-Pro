@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V42_MAPA_FIFA_ELIMINADOS"
+MODEL_VERSION = "V43_PRUEBA_UNA_VEZ_EJECUCION_MANUAL"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -7489,7 +7489,7 @@ def get_customer(email):
 
 def get_trial_max_queries():
     try:
-        return max(1, int(str(get_config_value("TRIAL_MAX_CONSULTAS", "2")).strip()))
+        return max(1, int(str(get_config_value("TRIAL_MAX_CONSULTAS", "1")).strip()))
     except Exception:
         return 2
 
@@ -7585,7 +7585,7 @@ def register_trial_query(email, team_a, team_b, details=None):
 def check_and_register_trial_query(team_a, team_b):
     """
     Para usuarios de prueba:
-    - permite máximo 2 consultas por correo,
+    - permite máximo 1 consulta por correo,
     - una consulta se define como un partido/equipos analizados,
     - repetir el mismo partido no descuenta otra consulta.
     """
@@ -7609,7 +7609,7 @@ def check_and_register_trial_query(team_a, team_b):
         log_access_event("trial_limit_reached", email=email, details={"used": used_before, "max": max_q})
         return (
             False,
-            f"Ya usaste tus {max_q} consultas gratuitas con este correo. Para seguir analizando partidos, compra el acceso completo.",
+            f"Ya usaste tu prueba gratuita con este correo. Para seguir analizando partidos, compra el acceso completo. Si no encuentras un código enviado, revisa Spam, Promociones o Correo no deseado.",
             used_before,
             max_q
         )
@@ -7622,7 +7622,7 @@ def check_and_register_trial_query(team_a, team_b):
 def create_or_get_trial_customer(email, coupon_code=""):
     """
     Crea una prueba gratuita por correo si no ha sido usada.
-    La prueba permite hasta TRIAL_MAX_CONSULTAS análisis de partidos por correo.
+    La prueba permite una consulta de partido por correo, configurable con TRIAL_MAX_CONSULTAS.
     """
     init_access_control_db()
     email = normalize_email(email)
@@ -7639,7 +7639,7 @@ def create_or_get_trial_customer(email, coupon_code=""):
     if used >= max_q:
         sync_trial_queries_used(email)
         log_access_event("trial_code_rejected_limit_reached", email=email, details={"used": used, "max": max_q})
-        return False, f"Este correo ya usó sus {max_q} consultas gratuitas. Para seguir usando la app, compra el acceso."
+        return False, f"Este correo ya usó su prueba gratuita. Para seguir usando la app, compra el acceso. Si solicitaste un código y no llegó, revisa Spam, Promociones o Correo no deseado."
 
     now = datetime.utcnow().isoformat(timespec="seconds")
     try:
@@ -7665,7 +7665,7 @@ def create_or_get_trial_customer(email, coupon_code=""):
             con.commit()
         sync_trial_queries_used(email)
         log_access_event("trial_customer_created_or_reused", email=email, details={"used": used, "max": max_q})
-        return True, f"Prueba gratuita activa. Tienes {max_q - used} consultas disponibles."
+        return True, f"Prueba gratuita activa. Tienes {max_q - used} consulta(s) disponible(s)."
     except Exception as e:
         return False, str(e)[:160]
 
@@ -7743,6 +7743,8 @@ Tu código dinámico de {label} para {brand} es:
 {token}
 
 Este código vence en 10 minutos y cambia en cada inicio de sesión.
+
+Si no ves el correo en la bandeja principal, revisa Spam, Promociones o Correo no deseado.
 
 Ingresa aquí:
 {app_url}
@@ -8351,6 +8353,63 @@ def monetization_settings():
     }
 
 
+
+def render_inline_purchase_section(default_email="", coupon_code=""):
+    """Muestra un mini formulario de compra cuando la prueba gratuita ya terminó."""
+    settings = monetization_settings()
+    init_access_control_db()
+    coupon_code = str(coupon_code or "").strip().upper()
+    coupon = get_coupon(coupon_code) if coupon_code else None
+    mp_cfg = mercadopago_settings()
+    st.markdown("### Comprar acceso")
+    st.caption(
+        "Ingresa tu correo para generar el enlace seguro de Mercado Pago. "
+        "Después del pago aprobado, la app registra tu correo y te envía el código de ingreso. "
+        "Si no ves correos de acceso, revisa Spam, Promociones o Correo no deseado."
+    )
+    if mercadopago_is_configured():
+        price = mp_cfg["coupon_price"] if coupon else mp_cfg["base_price"]
+        purchase_email_inline = st.text_input(
+            "Correo para recibir el link de Mercado Pago",
+            value=normalize_email(default_email),
+            key="inline_mp_purchase_email"
+        )
+        st.caption(f"Precio en checkout: **{format_money(price, mp_cfg['currency'])}**")
+        if st.button("Generar enlace de pago con Mercado Pago", type="primary", use_container_width=True, key="inline_generate_mp_link"):
+            email = normalize_email(purchase_email_inline)
+            if not is_valid_email(email):
+                st.error("Escribe un correo válido para asociar el acceso.")
+            else:
+                ok, msg, checkout_url = create_mercadopago_preference(
+                    email=email,
+                    price_amount=price,
+                    coupon_code=coupon["code"] if coupon else ""
+                )
+                if ok:
+                    st.session_state["inline_mp_checkout_url"] = checkout_url
+                    track_analytics_event(
+                        "payment_checkout_created_after_trial",
+                        language=st.session_state.get("app_language_name", ""),
+                        access_granted=False,
+                        admin_mode=False,
+                        details={"provider": "mercadopago", "price": price, "currency": mp_cfg["currency"]}
+                    )
+                    st.success("Enlace de pago creado. Ábrelo para completar la compra. Si luego no ves el código de acceso, revisa Spam, Promociones o Correo no deseado.")
+                else:
+                    st.error(msg)
+        checkout_url = st.session_state.get("inline_mp_checkout_url", "")
+        if checkout_url:
+            st.link_button("Abrir checkout seguro", checkout_url, type="primary", use_container_width=True)
+    else:
+        payment_link = settings.get("payment_link", "")
+        support = settings.get("support_contact", "")
+        if payment_link:
+            st.link_button("Abrir enlace de pago", payment_link, type="primary", use_container_width=True)
+        else:
+            st.warning("Mercado Pago aún no está configurado. Contacta soporte para activar tu acceso.")
+        if support:
+            st.caption(f"Soporte: {support}")
+
 def render_public_landing(settings):
     """
     Pantalla pública con:
@@ -8468,7 +8527,7 @@ def render_public_landing(settings):
     with tab_trial:
         st.subheader("Prueba gratuita")
         st.caption(
-            "La prueba gratuita permite 2 consultas por correo. "
+            "La prueba gratuita permite 1 consulta por correo. "
             "Recibirás un código dinámico que vence en 10 minutos."
         )
         trial_email = st.text_input("Correo para recibir el código gratuito", key="trial_email")
@@ -8482,7 +8541,7 @@ def render_public_landing(settings):
                     token = generate_login_token(email, purpose="trial")
                     sent, email_msg = send_login_token_email(email, token, purpose="trial")
                     if sent:
-                        st.success("Código enviado. Revisa tu correo.")
+                        st.success("Código enviado. Revisa tu correo. Si no aparece, revisa Spam, Promociones o Correo no deseado.")
                     else:
                         st.error(email_msg)
                     track_analytics_event("trial_code_requested", language=st.session_state.get("app_language_name", ""), details={"email_configured": sent})
@@ -8522,7 +8581,7 @@ def render_public_landing(settings):
                     token = generate_login_token(email, purpose="paid")
                     sent, email_msg = send_login_token_email(email, token, purpose="paid")
                     if sent:
-                        st.success("Código enviado. Revisa tu correo.")
+                        st.success("Código enviado. Revisa tu correo. Si no aparece, revisa Spam, Promociones o Correo no deseado.")
                     else:
                         st.error(email_msg)
                     track_analytics_event("paid_login_code_requested", language=st.session_state.get("app_language_name", ""), details={"email_configured": sent})
@@ -8562,8 +8621,8 @@ def render_public_landing(settings):
 
         mp_cfg = mercadopago_settings()
         if mercadopago_is_configured():
-            st.markdown("#### Pago automático con Mercado Pago")
-            purchase_email = st.text_input("Correo del comprador", key="mp_purchase_email")
+            st.markdown("#### Recibe tu link seguro de Mercado Pago")
+            purchase_email = st.text_input("Correo para recibir el link de Mercado Pago", key="mp_purchase_email")
             mp_amount = mp_cfg["coupon_price"] if coupon else mp_cfg["base_price"]
             st.caption(f"Precio en checkout: **{format_money(mp_amount, mp_cfg['currency'])}**")
 
@@ -8587,7 +8646,7 @@ def render_public_landing(settings):
                             admin_mode=False,
                             details={"provider": "mercadopago", "price": mp_amount, "currency": mp_cfg["currency"]}
                         )
-                        st.success("Enlace de pago creado. Ábrelo para completar la compra.")
+                        st.success("Enlace de pago creado. Ábrelo para completar la compra. Si luego no ves el código de acceso, revisa Spam, Promociones o Correo no deseado.")
                     else:
                         st.error(msg)
 
@@ -8985,7 +9044,7 @@ def streamlit_app():
         admin_mode=admin_mode,
         details={
             "require_access": access_settings.get("require_access", False),
-            "privacy_version": "V42_MAPA_FIFA_ELIMINADOS",
+            "privacy_version": "V43_PRUEBA_UNA_VEZ_EJECUCION_MANUAL",
             "analytics_scope": "anonymous_events_only"
         },
         once_key="session_start"
@@ -9279,9 +9338,13 @@ def streamlit_app():
 
     c1, c2, c3 = st.columns([2, 2, 2])
     with c1:
-        team_a = st.selectbox(tr("team_a", lang), teams, index=teams.index("Colombia") if "Colombia" in teams else 0)
+        team_options = ["Selecciona un equipo"] + teams
+        team_a_choice = st.selectbox(tr("team_a", lang), team_options, index=0, key="manual_team_a")
+        team_a = "" if team_a_choice == "Selecciona un equipo" else team_a_choice
     with c2:
-        team_b = st.selectbox(tr("team_b", lang), teams, index=teams.index("Portugal") if "Portugal" in teams else min(1, len(teams)-1))
+        team_options_b = ["Selecciona un equipo"] + teams
+        team_b_choice = st.selectbox(tr("team_b", lang), team_options_b, index=0, key="manual_team_b")
+        team_b = "" if team_b_choice == "Selecciona un equipo" else team_b_choice
     with c3:
         sede_pais = st.selectbox(
             "País sede del partido",
@@ -9292,16 +9355,37 @@ def streamlit_app():
             )
         )
 
-    # Límite de consultas gratuitas por correo.
-    if not admin_mode and st.session_state.get("access_type") == "trial":
+    st.info("Selecciona manualmente los dos equipos del versus y luego presiona el botón. La app no ejecuta ningún partido automáticamente.")
+
+    if not team_a or not team_b:
+        st.warning("Elige Equipo A y Equipo B para habilitar el análisis.")
+        st.stop()
+    if team_a == team_b:
+        st.warning("Equipo A y Equipo B deben ser diferentes.")
+        st.stop()
+
+    manual_match_key = f"{team_a}|{team_b}|{sede_pais}"
+    run_vs_button = st.button("▶️ Ejecutar análisis del versus seleccionado", type="primary", use_container_width=True)
+    if run_vs_button:
+        st.session_state["last_manual_match_key"] = manual_match_key
+
+    if st.session_state.get("last_manual_match_key") != manual_match_key:
+        st.stop()
+
+    # Límite de prueba gratuita: se descuenta solo cuando el usuario presiona el botón del versus.
+    if run_vs_button and not admin_mode and st.session_state.get("access_type") == "trial":
         trial_ok, trial_msg, trial_used, trial_max = check_and_register_trial_query(team_a, team_b)
         if trial_ok:
             st.info(trial_msg)
         else:
             st.error(trial_msg)
-            st.markdown("### Compra el acceso completo")
             st.write("Con el acceso completo puedes seguir consultando partidos sin el límite de prueba gratuita.")
+            render_inline_purchase_section(default_email=st.session_state.get("access_email", ""))
             st.stop()
+    elif not admin_mode and st.session_state.get("access_type") == "trial":
+        used = get_trial_queries_used(st.session_state.get("access_email", ""))
+        max_q = get_trial_max_queries()
+        st.caption(f"Prueba gratuita: {used}/{max_q} consulta(s) usada(s).")
 
     # Variables avanzadas automáticas desde internet y calendario interno gratuito.
     detected_fixture = find_internal_fixture(team_a, team_b)
