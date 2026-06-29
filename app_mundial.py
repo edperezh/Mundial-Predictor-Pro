@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V41_MEJORAS_PRE_LANZAMIENTO"
+MODEL_VERSION = "V41_1_FIX_AUTOREFRESH"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -5238,9 +5238,20 @@ def auto_refresh_worldcup_results_for_session(api_key="", min_year=2024, force=F
 
         current_results = dedupe_results_by_match(current_results)
         try:
-            current_results = replace_worldcup_results_with_canonical(current_results, force=force)
+            canonical_result = replace_worldcup_results_with_canonical(current_results, force=force)
+            # replace_worldcup_results_with_canonical devuelve (dataframe, info).
+            # En V41 se estaba guardando la tupla completa y eso rompía la app al armar la lista de equipos.
+            if isinstance(canonical_result, tuple):
+                current_results = canonical_result[0]
+            else:
+                current_results = canonical_result
         except Exception:
             pass
+
+        if isinstance(current_results, tuple):
+            current_results = current_results[0] if len(current_results) else pd.DataFrame()
+        if current_results is None or not isinstance(current_results, pd.DataFrame):
+            current_results = pd.DataFrame()
 
         try:
             _, _, fresh_mem = build_features_from_results(current_results, min_year=min_year)
@@ -9099,7 +9110,25 @@ def streamlit_app():
 
     st.divider()
 
-    teams = sorted(set(results["home_team"]).union(set(results["away_team"])))
+    # Defensa V41.1: si una actualización previa dejó una tupla en sesión, recupera solo el DataFrame.
+    if isinstance(results, tuple):
+        results = results[0] if len(results) else pd.DataFrame()
+        st.session_state.results = results
+    if results is None or not isinstance(results, pd.DataFrame) or results.empty:
+        st.error("No hay datos de partidos disponibles para construir la lista de equipos. Reentrena o carga el modelo oficial como administrador.")
+        st.stop()
+    required_team_cols = {"home_team", "away_team"}
+    if not required_team_cols.issubset(set(results.columns)):
+        st.error("Los datos cargados no tienen las columnas esperadas: home_team y away_team.")
+        st.stop()
+
+    teams = sorted(
+        set(results["home_team"].dropna().astype(str))
+        .union(set(results["away_team"].dropna().astype(str)))
+    )
+    if not teams:
+        st.error("No se encontraron equipos válidos para analizar.")
+        st.stop()
 
     st.subheader(tr("analyze_match", lang))
 
