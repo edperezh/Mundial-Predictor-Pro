@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V43_PRUEBA_UNA_VEZ_EJECUCION_MANUAL"
+MODEL_VERSION = "V44_NEQUI_FEEDBACK_PRECISION"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -5945,12 +5945,16 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
 
     if start_from_precision_match:
         before_len = len(wc)
-        if precision_allowed_keys:
+        # V44: no se restringe solo a pares del calendario interno, porque en eliminatorias
+        # los cruces pueden llegar como equipos reales no previstos en el calendario base.
+        # Se filtra por fecha de inicio de precisión y se conservan partidos posteriores,
+        # incluyendo dieciseisavos, octavos, cuartos, semifinal y final.
+        if pd.notna(precision_start_dt):
+            wc = wc[wc["date_dt"] >= precision_start_dt].copy()
+        elif precision_allowed_keys:
             wc["__precision_pair"] = wc.apply(lambda r: precision_pair_key(r["home_team"], r["away_team"]), axis=1)
             wc = wc[wc["__precision_pair"].isin(precision_allowed_keys)].copy()
             wc = wc.drop(columns=["__precision_pair"], errors="ignore")
-        elif pd.notna(precision_start_dt):
-            wc = wc[wc["date_dt"] >= precision_start_dt].copy()
         partidos_antes_precision = int(before_len - len(wc))
 
     if not wc.empty:
@@ -6011,7 +6015,7 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
                     "cohesion_a": 7, "cohesion_b": 7,
                     "controversy_a": 0, "controversy_b": 0,
                     "lineup_rating_a": 5.5, "lineup_rating_b": 5.5,
-                    "stage": "Fase de grupos", "urgency_a": 5, "urgency_b": 5,
+                    "stage": str(match.get("stage", "Fase de grupos")), "urgency_a": 5, "urgency_b": 5,
                 }
             )
 
@@ -6027,6 +6031,7 @@ def evaluate_worldcup_prediction_accuracy(training_result, results_df, min_year=
             rows.append({
                 "Fecha": match_date.date().isoformat(),
                 "Partido": f"{TEAM_FLAGS.get(h,'')} {TEAM_NAME_ES.get(h,h)} vs {TEAM_FLAGS.get(a,'')} {TEAM_NAME_ES.get(a,a)}",
+                "Fase": str(match.get("stage", "")),
                 "Marcador real": actual_score,
                 "Predicción 1X2": outcome_text(pred_outcome, TEAM_NAME_ES.get(h,h), TEAM_NAME_ES.get(a,a)),
                 "Resultado real": outcome_text(actual_outcome, TEAM_NAME_ES.get(h,h), TEAM_NAME_ES.get(a,a)),
@@ -6605,6 +6610,17 @@ def render_analytics_dashboard():
     )
 
     st.divider()
+    st.markdown("### 💬 Últimas sugerencias, errores y calificaciones")
+    feedback_df = load_feedback_report(limit=50)
+    if feedback_df is not None and not feedback_df.empty:
+        show_fb = feedback_df.copy()
+        if "email" in show_fb.columns:
+            show_fb["email"] = show_fb["email"].map(mask_email)
+        st.dataframe(safe_streamlit_df(show_fb), use_container_width=True, hide_index=True)
+    else:
+        st.info("Aún no hay reportes de sugerencias, errores o calificaciones.")
+
+    st.divider()
     render_analytics_email_controls()
 
     st.divider()
@@ -6898,6 +6914,7 @@ No incluye IP, nombres, correos de usuarios, tarjetas, contraseñas, API keys ni
         )
 
     coupon_text = coupon_report_as_text()
+    feedback_text = feedback_report_as_text()
 
     last24_sessions = 0
     last24_events = 0
@@ -6934,6 +6951,9 @@ VISITAS / ACCESOS POR DÍA
 
 REPORTE POR CUPÓN
 {coupon_text}
+
+SUGERENCIAS, ERRORES Y CALIFICACIONES
+{feedback_text}
 
 ÚLTIMOS EVENTOS
 {recent_text}
@@ -6983,6 +7003,16 @@ def send_analytics_email_report(force=False):
                 maintype="text",
                 subtype="csv",
                 filename=f"reporte_cupones_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+            )
+
+        feedback_df = load_feedback_report()
+        if feedback_df is not None and not feedback_df.empty:
+            feedback_csv = feedback_df.to_csv(index=False).encode("utf-8")
+            msg.add_attachment(
+                feedback_csv,
+                maintype="text",
+                subtype="csv",
+                filename=f"reportes_sugerencias_errores_calificaciones_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
             )
     except Exception:
         pass
@@ -7081,6 +7111,11 @@ SMTP_PORT = "465"
 SMTP_USER = "tu_correo@gmail.com"
 SMTP_PASSWORD = "tu_contraseña_de_aplicacion"
 SMTP_FROM = "Mundial Predictor Pro <tu_correo@gmail.com>"
+
+NEQUI_ENABLED = "true"
+NEQUI_PHONE = "3000000000"
+NEQUI_HOLDER = "Mundial Predictor Pro"
+NEQUI_INSTRUCTIONS = "Envía el pago por Nequi y registra la referencia para verificación manual."
 """, language="toml")
         st.caption(
             "Para Gmail debes usar una contraseña de aplicación, no tu contraseña normal. "
@@ -7331,6 +7366,24 @@ def init_access_control_db():
                 )
                 """
             )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    email TEXT,
+                    email_hash TEXT,
+                    category TEXT NOT NULL,
+                    rating INTEGER,
+                    page_context TEXT,
+                    message TEXT NOT NULL,
+                    status TEXT DEFAULT 'new',
+                    details TEXT
+                )
+                """
+            )
+            con.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ts ON user_feedback(ts)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_feedback_category ON user_feedback(category)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_access_events_ts ON access_events(ts)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_access_events_email ON access_events(email)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_login_tokens_email ON login_tokens(email)")
@@ -7376,6 +7429,205 @@ def log_access_event(event_type, email="", details=None):
             con.commit()
     except Exception:
         pass
+
+
+def nequi_settings():
+    """
+    Configuración de pago manual por Nequi.
+    Importante: este flujo no verifica automáticamente el pago. El acceso se activa solo después
+    de revisar manualmente el comprobante o el movimiento real.
+    """
+    enabled_raw = str(get_config_value("NEQUI_ENABLED", "false") or "false").lower().strip()
+    return {
+        "enabled": enabled_raw in ["1", "true", "yes", "si", "sí"],
+        "phone": str(get_config_value("NEQUI_PHONE", "") or "").strip(),
+        "holder": str(get_config_value("NEQUI_HOLDER", "") or "").strip(),
+        "instructions": str(get_config_value("NEQUI_INSTRUCTIONS", "Envía el pago por Nequi y luego registra tu correo y referencia para verificación manual.") or "").strip(),
+    }
+
+
+def nequi_is_configured():
+    cfg = nequi_settings()
+    return bool(cfg.get("enabled") and cfg.get("phone"))
+
+
+def register_nequi_payment_request(email, amount, currency="COP", coupon_code="", reference=""):
+    """Registra una solicitud manual de revisión de pago por Nequi."""
+    init_access_control_db()
+    email = normalize_email(email)
+    if not is_valid_email(email):
+        return False, "Correo inválido."
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    provider_payment_id = f"NEQUI-{hash_text(email)[:10]}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}"
+    raw = {
+        "reference": str(reference or "")[:120],
+        "method": "manual_nequi",
+        "notice": "Pendiente de verificación manual. No activa acceso automáticamente.",
+    }
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT OR IGNORE INTO payments
+                (provider, provider_payment_id, status, email, amount, currency, coupon_code, external_reference, created_at, raw_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "nequi_manual",
+                    provider_payment_id,
+                    "pending_review",
+                    email,
+                    float(amount or 0),
+                    str(currency or "COP"),
+                    str(coupon_code or "").strip().upper(),
+                    str(reference or "")[:120],
+                    now,
+                    json.dumps(raw, ensure_ascii=False),
+                )
+            )
+            con.commit()
+        log_access_event("nequi_payment_request", email=email, details={"amount": amount, "currency": currency, "coupon": coupon_code, "reference": str(reference or "")[:80]})
+        track_analytics_event(
+            "nequi_payment_request",
+            language=st.session_state.get("app_language_name", "") if STREAMLIT_OK else "",
+            access_granted=False,
+            admin_mode=bool(st.session_state.get("admin_mode", False)) if STREAMLIT_OK else False,
+            details={"amount": amount, "currency": currency, "coupon": coupon_code},
+        )
+        return True, "Solicitud registrada. El acceso se activa después de verificar el pago real. Revisa tu correo y también Spam/Promociones."
+    except Exception as e:
+        return False, str(e)[:180]
+
+
+def save_user_feedback(email, category, rating, message, page_context=""):
+    """Guarda sugerencias, errores y calificaciones de usuarios."""
+    init_access_control_db()
+    email = normalize_email(email)
+    category = str(category or "Sugerencia").strip()
+    message = str(message or "").strip()
+    page_context = str(page_context or "").strip()
+    if not message:
+        return False, "Escribe una sugerencia, error o comentario antes de enviar."
+    try:
+        rating_int = int(rating) if rating not in [None, ""] else None
+    except Exception:
+        rating_int = None
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                """
+                INSERT INTO user_feedback
+                (ts, email, email_hash, category, rating, page_context, message, status, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)
+                """,
+                (
+                    now,
+                    email if email else "",
+                    hash_text(email) if email else "",
+                    category,
+                    rating_int,
+                    page_context,
+                    message[:3000],
+                    json.dumps({"source": "app_feedback_tab"}, ensure_ascii=False),
+                )
+            )
+            con.commit()
+        log_access_event("user_feedback_submitted", email=email, details={"category": category, "rating": rating_int, "page_context": page_context})
+        track_analytics_event(
+            "user_feedback_submitted",
+            language=st.session_state.get("app_language_name", "") if STREAMLIT_OK else "",
+            access_granted=bool(st.session_state.get("access_granted", False)) if STREAMLIT_OK else False,
+            admin_mode=bool(st.session_state.get("admin_mode", False)) if STREAMLIT_OK else False,
+            details={"category": category, "rating": rating_int, "page_context": page_context},
+        )
+        return True, "Gracias. Tu reporte quedó registrado para mejorar la página."
+    except Exception as e:
+        return False, str(e)[:180]
+
+
+def load_feedback_report(limit=None):
+    """Carga reportes de errores, sugerencias y calificaciones."""
+    try:
+        init_access_control_db()
+        q = "SELECT ts, email, category, rating, page_context, message, status FROM user_feedback ORDER BY id DESC"
+        if limit:
+            q += f" LIMIT {int(limit)}"
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            return pd.read_sql_query(q, con)
+    except Exception:
+        return pd.DataFrame()
+
+
+def feedback_report_as_text(max_rows=20):
+    df = load_feedback_report(limit=max_rows)
+    if df is None or df.empty:
+        return "Sin sugerencias, errores o calificaciones todavía."
+    lines = []
+    for _, r in df.iterrows():
+        email_txt = mask_email(str(r.get("email", ""))) if str(r.get("email", "")).strip() else "sin correo"
+        rating_txt = "" if pd.isna(r.get("rating")) else f" · calificación {int(r.get('rating'))}/5"
+        msg = str(r.get("message", "")).replace("\n", " ")[:220]
+        lines.append(f"- {str(r.get('ts',''))[:19]} · {r.get('category','')} · {email_txt}{rating_txt} · {r.get('page_context','')}: {msg}")
+    return "\n".join(lines)
+
+
+def render_feedback_section(admin_mode=False):
+    """Pestaña pública/admin para sugerencias, errores y calificación."""
+    st.subheader("💬 Sugerencias, errores y calificación")
+    st.caption(
+        "Ayúdanos a mejorar Mundial Predictor Pro. Puedes reportar errores, proponer mejoras o calificar la experiencia. "
+        "No incluyas contraseñas, códigos de acceso, datos bancarios ni información sensible."
+    )
+
+    default_email = normalize_email(st.session_state.get("access_email", "")) if STREAMLIT_OK else ""
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        fb_email = st.text_input("Correo opcional para responderte", value=default_email, key="feedback_email")
+        fb_category = st.selectbox(
+            "Tipo de reporte",
+            ["Sugerencia de mejora", "Reporte de error", "Calificación general", "Problema de pago/acceso", "Otro"],
+            key="feedback_category"
+        )
+    with c2:
+        fb_rating = st.slider("Calificación de la página", 1, 5, 5, key="feedback_rating")
+        fb_context = st.selectbox(
+            "Sección relacionada",
+            ["General", "Campeón Mundial", "Mapa del Mundial", "Precisión", "Compra / acceso", "Privacidad", "Analítica", "Otro"],
+            key="feedback_context"
+        )
+
+    fb_message = st.text_area(
+        "Describe tu sugerencia o error",
+        placeholder="Ejemplo: encontré un error en el mapa, el correo no llegó, una pestaña no se entiende, etc.",
+        height=140,
+        key="feedback_message"
+    )
+    if st.button("Enviar reporte", type="primary", use_container_width=True, key="send_feedback_btn"):
+        ok, msg = save_user_feedback(fb_email, fb_category, fb_rating, fb_message, fb_context)
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
+
+    if admin_mode:
+        st.divider()
+        st.markdown("### Reportes recientes")
+        df_fb = load_feedback_report(limit=300)
+        if df_fb is not None and not df_fb.empty:
+            show = df_fb.copy()
+            if "email" in show.columns:
+                show["email"] = show["email"].map(mask_email)
+            st.dataframe(safe_streamlit_df(show), use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Descargar reportes CSV",
+                data=df_fb.to_csv(index=False).encode("utf-8"),
+                file_name="reportes_sugerencias_errores_calificaciones.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.info("Todavía no hay reportes de usuarios.")
 
 
 def get_coupon(code):
@@ -8406,9 +8658,29 @@ def render_inline_purchase_section(default_email="", coupon_code=""):
         if payment_link:
             st.link_button("Abrir enlace de pago", payment_link, type="primary", use_container_width=True)
         else:
-            st.warning("Mercado Pago aún no está configurado. Contacta soporte para activar tu acceso.")
+            st.warning("Mercado Pago aún no está configurado. Puedes usar Nequi si aparece habilitado abajo o contactar soporte.")
         if support:
             st.caption(f"Soporte: {support}")
+
+    nequi_cfg = nequi_settings()
+    if nequi_is_configured():
+        st.divider()
+        st.markdown("#### Pago manual por Nequi")
+        st.info("El pago por Nequi es manual: el acceso se activa únicamente después de verificar el pago real.")
+        st.write(f"**Número Nequi:** {nequi_cfg['phone']}")
+        if nequi_cfg.get("holder"):
+            st.caption(f"Titular: {nequi_cfg['holder']}")
+        st.caption(nequi_cfg.get("instructions", ""))
+        nequi_email_inline = st.text_input("Correo para asociar pago Nequi", value=normalize_email(default_email), key="inline_nequi_email")
+        nequi_ref_inline = st.text_input("Referencia, nota o últimos 4 dígitos del movimiento", key="inline_nequi_ref")
+        nequi_amount_inline = mp_cfg["coupon_price"] if coupon else mp_cfg["base_price"]
+        st.caption(f"Valor a enviar por Nequi: **{format_money(nequi_amount_inline, mp_cfg['currency'])}**")
+        if st.button("Registrar pago Nequi para verificación", use_container_width=True, key="inline_nequi_register"):
+            ok, msg = register_nequi_payment_request(nequi_email_inline, nequi_amount_inline, mp_cfg["currency"], coupon["code"] if coupon else "", nequi_ref_inline)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
 
 def render_public_landing(settings):
     """
@@ -8658,7 +8930,33 @@ def render_public_landing(settings):
                     "La app verificará el pago, registrará tu correo automáticamente y te enviará el código de ingreso."
                 )
 
-        elif payment_link:
+        nequi_available = nequi_is_configured()
+        if nequi_available:
+            st.divider()
+            st.markdown("#### Pago manual por Nequi")
+            st.info("Nequi es una opción manual. El acceso no se activa automáticamente: primero se verifica el pago real.")
+            nequi_cfg = nequi_settings()
+            st.write(f"**Número Nequi:** {nequi_cfg['phone']}")
+            if nequi_cfg.get("holder"):
+                st.caption(f"Titular: {nequi_cfg['holder']}")
+            st.caption(nequi_cfg.get("instructions", ""))
+            nequi_email = st.text_input("Correo para asociar el pago Nequi", key="nequi_purchase_email")
+            nequi_reference = st.text_input("Referencia, nota o últimos 4 dígitos del movimiento", key="nequi_reference")
+            st.caption(f"Valor a enviar por Nequi: **{format_money(final_price, display_currency)}**")
+            if st.button("Registrar pago Nequi para verificación", use_container_width=True, key="nequi_register_payment"):
+                ok, msg = register_nequi_payment_request(
+                    nequi_email,
+                    final_price,
+                    display_currency,
+                    coupon["code"] if coupon else "",
+                    nequi_reference,
+                )
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
+        if (not mercadopago_is_configured()) and payment_link:
             st.markdown("#### Enlace de pago manual")
             if st.button("Registrar intención de compra", use_container_width=True, help="Cuenta el clic y muestra el botón de pago."):
                 track_analytics_event(
@@ -8670,9 +8968,9 @@ def render_public_landing(settings):
                 )
                 st.info("Abre el enlace de pago. Si el proveedor no devuelve confirmación automática, el acceso se activa manualmente.")
             st.link_button("Abrir enlace de pago", payment_link, type="primary", use_container_width=True)
-        else:
+        elif (not mercadopago_is_configured()) and (not nequi_available):
             st.warning(
-                "Aún no configuraste un enlace de pago ni MERCADOPAGO_ACCESS_TOKEN. "
+                "Aún no configuraste un enlace de pago, MERCADOPAGO_ACCESS_TOKEN ni NEQUI_PHONE. "
                 "Puedes registrar clientes manualmente desde el panel admin."
             )
 
@@ -9667,19 +9965,29 @@ def streamlit_app():
     st.divider()
 
     with st.expander("ℹ️ ¿Para qué sirve cada pestaña?", expanded=False):
-        st.markdown("""
-        - **Campeón Mundial:** ranking de probabilidad estimada de campeón y simulación Monte Carlo.
-        - **Mapa del Mundial:** grupos, clasificados proyectados y ruta de eliminatorias completa simulada.
-        - **Precisión:** auditoría de aciertos del modelo con partidos ya jugados.
-        - **Modelos / Matrices / Peso de variables:** secciones técnicas para validar cómo trabaja el modelo.
-        - **Datos del partido:** variables usadas para el análisis del encuentro seleccionado.
-        - **Privacidad:** qué datos se guardan y qué datos no se guardan.
-        - **Analítica:** visitas, accesos, cupones y eventos administrativos.
-        """)
+        if admin_mode:
+            st.markdown("""
+            - **Campeón Mundial:** ranking de probabilidad estimada de campeón y simulación Monte Carlo.
+            - **Mapa del Mundial:** grupos, clasificados proyectados y ruta de eliminatorias completa simulada.
+            - **Precisión:** auditoría de aciertos del modelo con partidos ya jugados, incluyendo fase eliminatoria cuando existan resultados cargados.
+            - **Modelos / Matrices / Peso de variables:** secciones técnicas para validar cómo trabaja el modelo.
+            - **Datos del partido:** variables usadas para el análisis del encuentro seleccionado.
+            - **Privacidad:** qué datos se guardan y qué datos no se guardan.
+            - **Sugerencias:** reportes de errores, calificaciones y propuestas de mejora enviados por usuarios.
+            - **Analítica:** visitas, accesos, cupones, pagos y eventos administrativos.
+            """)
+        else:
+            st.markdown("""
+            - **Campeón Mundial:** muestra una estimación educativa de favoritos y probabilidades de campeón.
+            - **Mapa del Mundial:** presenta grupos y una ruta proyectada de eliminatorias con base estadística.
+            - **Precisión:** muestra cómo va funcionando el modelo frente a partidos ya jugados.
+            - **Sugerencias:** permite reportar errores, enviar ideas de mejora y calificar la página.
+            - **Privacidad:** explica qué datos se guardan y qué datos no se guardan.
+            """)
         st.caption("Todas las probabilidades son estimaciones estadísticas educativas. No garantizan resultados.")
 
     if admin_mode:
-        tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
             tr("tabs_champion", lang),
             tr("tabs_map", lang),
             tr("tabs_precision", lang),
@@ -9689,13 +9997,15 @@ def streamlit_app():
             tr("tabs_importance", lang),
             tr("tabs_match_data", lang),
             "🔒 Privacidad",
+            "💬 Sugerencias",
             "📊 Analítica"
         ])
     else:
-        tab0, tab1, tab2, tab_privacy = st.tabs([
+        tab0, tab1, tab2, tab_feedback, tab_privacy = st.tabs([
             tr("tabs_champion", lang),
             tr("tabs_map", lang),
             tr("tabs_precision", lang),
+            "💬 Sugerencias",
             "🔒 Privacidad"
         ])
 
@@ -9958,8 +10268,14 @@ def streamlit_app():
             render_privacy_policy_section(compact=False)
 
         with tab9:
+            render_feedback_section(admin_mode=True)
+
+        with tab10:
             render_analytics_dashboard()
     else:
+        with tab_feedback:
+            render_feedback_section(admin_mode=False)
+
         with tab_privacy:
             render_privacy_policy_section(compact=False)
 
