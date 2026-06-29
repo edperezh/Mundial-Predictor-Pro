@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V41_1_FIX_AUTOREFRESH"
+MODEL_VERSION = "V42_MAPA_FIFA_ELIMINADOS"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -4523,7 +4523,9 @@ def estimate_champion_probabilities(mem, results_df, teams=None):
         df["prob_campeon_%"] = df["fuerza_bruta"] / total * 100.0
 
     df["ranking"] = df["prob_campeon_%"].rank(ascending=False, method="first").astype(int)
-    return df.sort_values("prob_campeon_%", ascending=False).reset_index(drop=True)
+    df = df.sort_values("prob_campeon_%", ascending=False).reset_index(drop=True)
+    df = apply_elimination_to_champion_probabilities(df, results_df)
+    return df
 
 
 def build_worldcup_performance_timeline(results_df, teams=None):
@@ -5294,6 +5296,153 @@ def outcome_text(outcome, team_a=None, team_b=None):
     return "Sin dato"
 
 
+
+
+# Cuadro base de eliminatorias 2026 usado por el mapa oficial-proyectado.
+# La estructura replica el orden deportivo de llaves mostrado por el usuario/FIFA, sin usar logos ni diseño protegido.
+OFFICIAL_KNOCKOUT_R32_2026 = [
+    {"slot": "P74", "side": "left",  "team_a": "Germany", "team_b": "Paraguay", "date": "2026-06-29", "time": "15:30"},
+    {"slot": "P77", "side": "left",  "team_a": "France", "team_b": "Sweden", "date": "2026-06-30", "time": "16:00"},
+    {"slot": "P73", "side": "left",  "team_a": "South Africa", "team_b": "Canada", "date": "2026-06-29", "time": "20:00"},
+    {"slot": "P75", "side": "left",  "team_a": "Netherlands", "team_b": "Morocco", "date": "2026-06-29", "time": "20:00"},
+    {"slot": "P83", "side": "left",  "team_a": "Portugal", "team_b": "Croatia", "date": "2026-07-02", "time": "18:00"},
+    {"slot": "P84", "side": "left",  "team_a": "Spain", "team_b": "Austria", "date": "2026-07-02", "time": "14:00"},
+    {"slot": "P81", "side": "left",  "team_a": "United States", "team_b": "Bosnia and Herzegovina", "date": "2026-07-01", "time": "19:00"},
+    {"slot": "P82", "side": "left",  "team_a": "Belgium", "team_b": "Senegal", "date": "2026-07-01", "time": "15:00"},
+    {"slot": "P76", "side": "right", "team_a": "Brazil", "team_b": "Japan", "date": "2026-06-29", "time": "12:00"},
+    {"slot": "P78", "side": "right", "team_a": "Ivory Coast", "team_b": "Norway", "date": "2026-06-30", "time": "12:00"},
+    {"slot": "P79", "side": "right", "team_a": "Mexico", "team_b": "Ecuador", "date": "2026-06-30", "time": "20:00"},
+    {"slot": "P80", "side": "right", "team_a": "England", "team_b": "DR Congo", "date": "2026-07-01", "time": "11:00"},
+    {"slot": "P86", "side": "right", "team_a": "Argentina", "team_b": "Cape Verde", "date": "2026-07-03", "time": "17:00"},
+    {"slot": "P88", "side": "right", "team_a": "Australia", "team_b": "Egypt", "date": "2026-07-03", "time": "13:00"},
+    {"slot": "P85", "side": "right", "team_a": "Switzerland", "team_b": "Algeria", "date": "2026-07-02", "time": "22:00"},
+    {"slot": "P87", "side": "right", "team_a": "Colombia", "team_b": "Ghana", "date": "2026-07-03", "time": "20:30"},
+]
+
+OFFICIAL_KNOCKOUT_NEXT_2026 = {
+    "P89": {"fase": "Octavos", "side": "left",  "from": ["P74", "P77"], "date": "2026-07-04", "time": "16:00"},
+    "P90": {"fase": "Octavos", "side": "left",  "from": ["P73", "P75"], "date": "2026-07-04", "time": "12:00"},
+    "P93": {"fase": "Octavos", "side": "left",  "from": ["P83", "P84"], "date": "2026-07-06", "time": "14:00"},
+    "P94": {"fase": "Octavos", "side": "left",  "from": ["P81", "P82"], "date": "2026-07-06", "time": "19:00"},
+    "P91": {"fase": "Octavos", "side": "right", "from": ["P76", "P78"], "date": "2026-07-05", "time": "15:00"},
+    "P92": {"fase": "Octavos", "side": "right", "from": ["P79", "P80"], "date": "2026-07-05", "time": "19:00"},
+    "P95": {"fase": "Octavos", "side": "right", "from": ["P86", "P88"], "date": "2026-07-07", "time": "11:00"},
+    "P96": {"fase": "Octavos", "side": "right", "from": ["P85", "P87"], "date": "2026-07-07", "time": "15:00"},
+    "P97": {"fase": "Cuartos", "side": "left",  "from": ["P89", "P90"], "date": "2026-07-09", "time": "15:00"},
+    "P98": {"fase": "Cuartos", "side": "left",  "from": ["P93", "P94"], "date": "2026-07-10", "time": "14:00"},
+    "P99": {"fase": "Cuartos", "side": "right", "from": ["P91", "P92"], "date": "2026-07-09", "time": "18:00"},
+    "P100": {"fase": "Cuartos", "side": "right", "from": ["P95", "P96"], "date": "2026-07-11", "time": "20:00"},
+    "P101": {"fase": "Semifinal", "side": "left",  "from": ["P97", "P98"], "date": "2026-07-14", "time": "14:00"},
+    "P102": {"fase": "Semifinal", "side": "right", "from": ["P99", "P100"], "date": "2026-07-15", "time": "14:00"},
+    "P104": {"fase": "Final", "side": "center", "from": ["P101", "P102"], "date": "2026-07-19", "time": "14:00"},
+    "P103": {"fase": "Tercer puesto", "side": "center", "from": ["P101", "P102"], "date": "2026-07-18", "time": "16:00", "losers": True},
+}
+
+
+def official_knockout_initial_teams():
+    teams = []
+    for m in OFFICIAL_KNOCKOUT_R32_2026:
+        teams.extend([normalize_team_name(m["team_a"]), normalize_team_name(m["team_b"])])
+    return set(teams)
+
+
+def get_played_match_result_between(results_df, team_a, team_b):
+    """Devuelve resultado cargado entre dos equipos si existe; sirve para actualizar eliminatorias reales."""
+    if results_df is None or results_df.empty or not team_a or not team_b:
+        return None
+    a = normalize_team_name(team_a)
+    b = normalize_team_name(team_b)
+    try:
+        wc = get_worldcup_2026_results(results_df, WC_2026_TEAMS)
+    except Exception:
+        wc = results_df.copy()
+    if wc is None or wc.empty:
+        return None
+    for _, row in wc.iterrows():
+        try:
+            h = normalize_team_name(row.get("home_team", ""))
+            aw = normalize_team_name(row.get("away_team", ""))
+            if set([h, aw]) != set([a, b]):
+                continue
+            if pd.isna(row.get("home_score")) or pd.isna(row.get("away_score")):
+                continue
+            hs = int(row.get("home_score"))
+            gs = int(row.get("away_score"))
+            if h == a:
+                score_a, score_b = hs, gs
+            else:
+                score_a, score_b = gs, hs
+            winner = None
+            loser = None
+            if score_a > score_b:
+                winner, loser = a, b
+            elif score_b > score_a:
+                winner, loser = b, a
+            return {"team_a": a, "team_b": b, "score_a": score_a, "score_b": score_b, "winner": winner, "loser": loser, "date": row.get("date", ""), "source": "resultado cargado"}
+        except Exception:
+            continue
+    return None
+
+
+def get_worldcup_eliminated_teams(results_df=None):
+    """Equipos eliminados con base en fase de grupos finalizada y resultados de eliminatorias cargados."""
+    eliminated = set()
+    official_32 = official_knockout_initial_teams()
+    try:
+        completed = strict_completed_worldcup_matches(results_df) if results_df is not None else pd.DataFrame()
+        completed_count = len(completed) if completed is not None else 0
+    except Exception:
+        completed_count = 0
+    if completed_count >= 72 and len(official_32) >= 32:
+        eliminated.update(set(WC_2026_TEAMS) - official_32)
+    for match in OFFICIAL_KNOCKOUT_R32_2026:
+        played = get_played_match_result_between(results_df, match["team_a"], match["team_b"])
+        if played and played.get("loser"):
+            eliminated.add(played["loser"])
+    try:
+        proj = build_official_knockout_projection(pd.DataFrame({"equipo": list(WC_2026_TEAMS), "prob_campeon_%": [1]*len(WC_2026_TEAMS)}), results_df=results_df)
+        if proj is not None and not proj.empty:
+            for _, r in proj.iterrows():
+                if str(r.get("resultado_real", "")).strip() and r.get("perdedor_real"):
+                    eliminated.add(normalize_team_name(r.get("perdedor_real")))
+    except Exception:
+        pass
+    return {t for t in eliminated if t in set(WC_2026_TEAMS)}
+
+
+def apply_elimination_to_champion_probabilities(champion_df, results_df=None):
+    """Pone en 0% a eliminados y renormaliza los equipos vivos a 100%."""
+    if champion_df is None or champion_df.empty:
+        return champion_df
+    df = champion_df.copy()
+    eliminated = get_worldcup_eliminated_teams(results_df)
+    if "equipo" not in df.columns or "prob_campeon_%" not in df.columns:
+        return df
+    df["estado_mundial"] = df["equipo"].apply(lambda t: "Eliminado" if normalize_team_name(t) in eliminated else "Vivo")
+    df.loc[df["estado_mundial"] == "Eliminado", "prob_campeon_%"] = 0.0
+    alive_mask = df["estado_mundial"] != "Eliminado"
+    total_alive = float(df.loc[alive_mask, "prob_campeon_%"].sum())
+    if total_alive > 0:
+        df.loc[alive_mask, "prob_campeon_%"] = df.loc[alive_mask, "prob_campeon_%"] / total_alive * 100.0
+    df["ranking"] = df["prob_campeon_%"].rank(ascending=False, method="first").astype(int)
+    return df.sort_values(["prob_campeon_%", "estado_mundial"], ascending=[False, True]).reset_index(drop=True)
+
+
+def apply_elimination_to_mc_probabilities(mc_df, results_df=None):
+    """Pone en 0% los eliminados también en Monte Carlo para que ambas vistas sean consistentes."""
+    if mc_df is None or mc_df.empty or "equipo" not in mc_df.columns:
+        return mc_df
+    df = mc_df.copy()
+    eliminated = get_worldcup_eliminated_teams(results_df)
+    if "prob_campeon_montecarlo_%" in df.columns:
+        df.loc[df["equipo"].map(lambda t: normalize_team_name(t) in eliminated), "prob_campeon_montecarlo_%"] = 0.0
+        total = float(df["prob_campeon_montecarlo_%"].sum())
+        if total > 0:
+            df["prob_campeon_montecarlo_%"] = df["prob_campeon_montecarlo_%"] / total * 100.0
+        df["ranking_mc"] = df["prob_campeon_montecarlo_%"].rank(ascending=False, method="first").astype(int)
+        df = df.sort_values("prob_campeon_montecarlo_%", ascending=False).reset_index(drop=True)
+    return df
+
 def get_worldcup_group_tables_from_calendar(results_df=None):
     """Tabla de grupos basada en calendario interno + resultados."""
     tables = {}
@@ -5449,94 +5598,108 @@ def pair_win_probability_for_bracket(team_a, team_b, champion_lookup, training_r
     return sa / total * 100.0, sb / total * 100.0, "fuerza campeón"
 
 
-def build_complete_knockout_projection(champion_df, results_df=None, training_result=None, mem=None):
-    """
-    Construye bracket completo: dieciseisavos, octavos, cuartos, semifinal y final.
-    Es una simulación estadística; no garantiza resultados ni reemplaza el cuadro oficial.
-    """
-    if champion_df is None or champion_df.empty:
-        return pd.DataFrame()
 
-    champion_lookup = champion_df.set_index("equipo")["prob_campeon_%"].to_dict()
-    r32 = build_projected_bracket_pairs(champion_df, results_df)
-    if r32 is None or r32.empty:
-        return pd.DataFrame()
+def build_official_knockout_projection(champion_df, results_df=None, training_result=None, mem=None):
+    """Construye cuadro de eliminatorias con formación oficial cargada y actualización por resultados."""
+    champion_lookup = champion_df.set_index("equipo")["prob_campeon_%"].to_dict() if champion_df is not None and not champion_df.empty else {}
+    rows, winners, losers = [], {}, {}
 
-    rounds = ["Dieciseisavos", "Octavos", "Cuartos", "Semifinal", "Final"]
-    current_pairs = [(row["equipo_a"], row["equipo_b"]) for _, row in r32.iterrows()]
-    all_rows = []
-
-    for round_idx, round_name in enumerate(rounds, start=1):
-        winners = []
-        for match_idx, (a, b) in enumerate(current_pairs, start=1):
+    def decide_match(slot, fase, side, a, b, date="", time="", round_order=1, match_order=1):
+        a = normalize_team_name(a) if a else ""
+        b = normalize_team_name(b) if b else ""
+        played = get_played_match_result_between(results_df, a, b) if a and b else None
+        resultado_real = ""
+        perdedor_real = ""
+        if played and played.get("winner"):
+            winner = played["winner"]
+            loser = played.get("loser", "")
+            pa, pb = (100.0, 0.0) if winner == a else (0.0, 100.0)
+            source = "resultado oficial/cargado"
+            resultado_real = f"{int(played['score_a'])}-{int(played['score_b'])}"
+            perdedor_real = loser
+        else:
             pa, pb, source = pair_win_probability_for_bracket(a, b, champion_lookup, training_result, mem, results_df)
             winner = a if pa >= pb else b
-            winners.append(winner)
-            all_rows.append({
-                "fase": round_name,
-                "orden_fase": round_idx,
-                "partido": match_idx,
-                "equipo_a": a,
-                "equipo_b": b,
-                "equipo_a_es": TEAM_NAME_ES.get(a, a),
-                "equipo_b_es": TEAM_NAME_ES.get(b, b),
-                "flag_a": TEAM_FLAGS.get(a, "🏳️"),
-                "flag_b": TEAM_FLAGS.get(b, "🏳️"),
-                "prob_a_avanza_%": round(pa, 1),
-                "prob_b_avanza_%": round(pb, 1),
-                "ganador_estimado": winner,
-                "ganador_estimado_es": TEAM_NAME_ES.get(winner, winner),
-                "fuente_prob": source,
-            })
-        current_pairs = []
-        for i in range(0, len(winners), 2):
-            if i + 1 < len(winners):
-                current_pairs.append((winners[i], winners[i + 1]))
-        if not current_pairs:
-            break
+            loser = b if winner == a else a
+        winners[slot] = winner
+        losers[slot] = loser
+        rows.append({
+            "slot": slot, "fase": fase, "side": side, "orden_fase": round_order, "partido": match_order,
+            "date": date, "time": time, "equipo_a": a, "equipo_b": b,
+            "equipo_a_es": TEAM_NAME_ES.get(a, a), "equipo_b_es": TEAM_NAME_ES.get(b, b),
+            "flag_a": TEAM_FLAGS.get(a, "🏳️"), "flag_b": TEAM_FLAGS.get(b, "🏳️"),
+            "prob_a_avanza_%": round(float(pa), 1), "prob_b_avanza_%": round(float(pb), 1),
+            "ganador_estimado": winner, "ganador_estimado_es": TEAM_NAME_ES.get(winner, winner),
+            "perdedor_estimado": loser, "perdedor_real": perdedor_real, "resultado_real": resultado_real, "fuente_prob": source,
+        })
 
-    return pd.DataFrame(all_rows)
+    for i, match in enumerate(OFFICIAL_KNOCKOUT_R32_2026, start=1):
+        decide_match(match["slot"], "Dieciseisavos", match["side"], match["team_a"], match["team_b"], match.get("date", ""), match.get("time", ""), 1, i)
+
+    round_order = {"Octavos": 2, "Cuartos": 3, "Semifinal": 4, "Tercer puesto": 5, "Final": 6}
+    for slot in ["P89", "P90", "P93", "P94", "P91", "P92", "P95", "P96", "P97", "P98", "P99", "P100", "P101", "P102", "P103", "P104"]:
+        meta = OFFICIAL_KNOCKOUT_NEXT_2026[slot]
+        f1, f2 = meta["from"]
+        a, b = (losers.get(f1, ""), losers.get(f2, "")) if meta.get("losers") else (winners.get(f1, ""), winners.get(f2, ""))
+        fase = meta["fase"]
+        same_phase_rows = [r for r in rows if r["fase"] == fase]
+        decide_match(slot, fase, meta.get("side", "center"), a, b, meta.get("date", ""), meta.get("time", ""), round_order.get(fase, 9), len(same_phase_rows) + 1)
+    return pd.DataFrame(rows)
+
+
+def build_complete_knockout_projection(champion_df, results_df=None, training_result=None, mem=None):
+    """Construye el bracket completo con el cuadro oficial cargado. Es una estimación estadística; no garantiza resultados."""
+    return build_official_knockout_projection(champion_df, results_df=results_df, training_result=training_result, mem=mem)
+
 
 
 def render_complete_knockout_html(bracket_df):
     if bracket_df is None or bracket_df.empty:
         return "<p style='color:#cbd5e1'>No hay datos suficientes para construir el bracket completo.</p>"
 
-    columns = []
-    for fase in ["Dieciseisavos", "Octavos", "Cuartos", "Semifinal", "Final"]:
-        d = bracket_df[bracket_df["fase"] == fase].copy()
-        cards = []
-        for _, r in d.iterrows():
-            cards.append(f'''
-              <div class="ko-card" title="{r['fuente_prob']} · Ganador estimado: {r['ganador_estimado_es']}">
-                <div class="ko-match-title">{fase} · P{int(r['partido'])}</div>
-                <div class="ko-team {'winner' if r['ganador_estimado']==r['equipo_a'] else ''}"><span>{r['flag_a']} <b>{r['equipo_a_es']}</b></span><small>{float(r['prob_a_avanza_%']):.1f}%</small></div>
-                <div class="versus">vs</div>
-                <div class="ko-team {'winner' if r['ganador_estimado']==r['equipo_b'] else ''}"><span>{r['flag_b']} <b>{r['equipo_b_es']}</b></span><small>{float(r['prob_b_avanza_%']):.1f}%</small></div>
-              </div>
-            ''')
-        columns.append(f'''
-          <div class="ko-col">
-            <div class="ko-title">{fase}</div>
-            {''.join(cards)}
+    def card(r):
+        fuente = str(r.get("fuente_prob", ""))
+        resultado = str(r.get("resultado_real", ""))
+        extra = f" · Resultado cargado: {resultado}" if resultado else ""
+        date_txt = f"{r.get('date','')} {r.get('time','')}".strip()
+        title = f"{r.get('slot','')} · {fuente}{extra} · Ganador estimado: {r.get('ganador_estimado_es','')}"
+        a_win = r.get("ganador_estimado") == r.get("equipo_a")
+        b_win = r.get("ganador_estimado") == r.get("equipo_b")
+        return f"""
+          <div class="ko-card" title="{title}">
+            <div class="ko-match-title"><span>{r.get('slot','')}</span><small>{date_txt}</small></div>
+            <div class="ko-team {'winner' if a_win else ''}"><span>{r.get('flag_a','🏳️')} <b>{r.get('equipo_a_es','')}</b></span><small>{float(r.get('prob_a_avanza_%',0)):.1f}%</small></div>
+            <div class="versus">vs</div>
+            <div class="ko-team {'winner' if b_win else ''}"><span>{r.get('flag_b','🏳️')} <b>{r.get('equipo_b_es','')}</b></span><small>{float(r.get('prob_b_avanza_%',0)):.1f}%</small></div>
           </div>
-        ''')
+        """
+
+    layout = [("Dieciseisavos", "left", "Dieciseisavos"), ("Octavos", "left", "Octavos"), ("Cuartos", "left", "Cuartos"), ("Semifinal", "left", "Semifinal"), ("Final", "center", "Final"), ("Semifinal", "right", "Semifinal"), ("Cuartos", "right", "Cuartos"), ("Octavos", "right", "Octavos"), ("Dieciseisavos", "right", "Dieciseisavos")]
+    columns = []
+    for fase, side, label in layout:
+        d = bracket_df[(bracket_df["fase"] == fase) & (bracket_df["side"] == side)].copy().sort_values("partido", ascending=True)
+        if fase == "Final":
+            third = bracket_df[bracket_df["fase"] == "Tercer puesto"].copy()
+            cards = ''.join(card(r) for _, r in d.iterrows())
+            if not third.empty:
+                cards += "<div class='ko-title secondary'>Tercer puesto</div>" + ''.join(card(r) for _, r in third.iterrows())
+        else:
+            cards = ''.join(card(r) for _, r in d.iterrows())
+        columns.append(f"<div class='ko-col {side}'><div class='ko-title'>{label}</div>{cards}</div>")
 
     champion = bracket_df[bracket_df["fase"] == "Final"]
     champion_txt = ""
     if not champion.empty:
         w = champion.iloc[0]["ganador_estimado_es"]
-        champion_txt = f"<div class='champion-box'>🏆 Ganador estadístico proyectado: <b>{w}</b><br><small>Estimación basada en datos disponibles; no garantiza resultados.</small></div>"
-
+        champion_txt = f"<div class='champion-box'>🏆 Ganador estadístico proyectado: <b>{w}</b><br><small>Estimación basada en resultados cargados, modelo 1X2 y fuerza de campeón. No asegura resultados.</small></div>"
     return f"""
       {champion_txt}
-      <div class="ko-grid">{''.join(columns)}</div>
+      <div class="ko-official-grid">{''.join(columns)}</div>
     """
 
 def render_worldcup_map_html(champion_df, results_df, mc_df=None, training_result=None, mem=None):
     """Renderiza un mapa/dashboard interactivo en HTML."""
     tables = get_worldcup_group_tables_from_calendar(results_df)
-    bracket = build_projected_bracket_pairs(champion_df, results_df)
     complete_bracket = build_complete_knockout_projection(champion_df, results_df, training_result=training_result, mem=mem)
     complete_bracket_html = render_complete_knockout_html(complete_bracket)
 
@@ -5594,22 +5757,6 @@ def render_worldcup_map_html(champion_df, results_df, mc_df=None, training_resul
           </div>
         """)
 
-    bracket_html = []
-    for _, r in bracket.iterrows():
-        total = max(0.0001, float(r["prob_a"]) + float(r["prob_b"]))
-        pa = float(r["prob_a"]) / total * 100
-        pb = 100 - pa
-        title_a = f"{r['equipo_a_es']} | {r['via_a']} | fuerza base {r['prob_a']:.2f}%"
-        title_b = f"{r['equipo_b_es']} | {r['via_b']} | fuerza base {r['prob_b']:.2f}%"
-        bracket_html.append(f"""
-          <div class="match-card">
-            <div class="match-title">R32 · Llave {int(r["llave"])}</div>
-            <div class="match-team" title="{title_a}"><span>{r["flag_a"]} <b>{r["equipo_a_es"]}</b></span><small>{pa:.1f}% fuerza relativa</small></div>
-            <div class="versus">vs</div>
-            <div class="match-team" title="{title_b}"><span>{r["flag_b"]} <b>{r["equipo_b_es"]}</b></span><small>{pb:.1f}% fuerza relativa</small></div>
-          </div>
-        """)
-
     html = f"""
     <div class="wc-map">
       <style>
@@ -5635,6 +5782,7 @@ def render_worldcup_map_html(champion_df, results_df, mc_df=None, training_resul
         .flag {{ font-size:18px; }}
         .team-stats {{ display:flex; justify-content:space-between; color:#cbd5e1; font-size:11px; margin-top:4px; gap:6px; }}
         .dashboard-grid {{ display:grid; grid-template-columns: 1fr 1.4fr; gap:14px; }}
+        .dashboard-grid.one-col {{ grid-template-columns: 1fr; }}
         .panel {{ background:rgba(255,255,255,.075); border:1px solid rgba(255,255,255,.14); border-radius:18px; padding:14px; }}
         .fav-row {{ margin:10px 0; cursor:help; }}
         .fav-row > div:first-child {{ display:flex; justify-content:space-between; gap:10px; align-items:center; font-size:13px; }}
@@ -5642,11 +5790,13 @@ def render_worldcup_map_html(champion_df, results_df, mc_df=None, training_resul
         .bar {{ height:8px; background:rgba(255,255,255,.13); border-radius:99px; overflow:hidden; margin-top:6px; }}
         .bar span {{ display:block; height:100%; background:linear-gradient(90deg,#22c55e,#38bdf8); border-radius:99px; }}
         .bracket-grid {{ display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:10px; }}
-        .ko-grid {{ display:grid; grid-template-columns: repeat(5, minmax(170px, 1fr)); gap:12px; overflow-x:auto; padding-bottom:8px; }}
+        .ko-official-grid {{ display:grid; grid-template-columns: 1.15fr .95fr .9fr .85fr 1fr .85fr .9fr .95fr 1.15fr; gap:12px; overflow-x:auto; padding-bottom:8px; align-items:start; }}
         .ko-col {{ min-width:170px; }}
-        .ko-title {{ color:#fef3c7; font-weight:900; margin:10px 0; text-transform:uppercase; font-size:12px; letter-spacing:.05em; }}
+        .ko-title {{ color:#fef3c7; font-weight:900; margin:10px 0; text-transform:uppercase; font-size:12px; letter-spacing:.05em; text-align:center; }}
+        .ko-title.secondary {{ color:#bfdbfe; margin-top:18px; }}
         .ko-card {{ background:rgba(2,6,23,.48); border:1px solid rgba(148,163,184,.24); border-radius:15px; padding:10px; margin-bottom:10px; }}
-        .ko-match-title {{ color:#93c5fd; font-size:11px; font-weight:800; margin-bottom:8px; }}
+        .ko-match-title {{ color:#93c5fd; font-size:11px; font-weight:800; margin-bottom:8px; display:flex; justify-content:space-between; gap:6px; }}
+        .ko-match-title small {{ color:#cbd5e1; font-weight:600; }}
         .ko-team {{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:7px; border-radius:11px; background:rgba(255,255,255,.07); font-size:12px; }}
         .ko-team.winner {{ border-left:4px solid #22c55e; background:rgba(34,197,94,.12); }}
         .champion-box {{ margin:10px 0 14px; padding:12px; border-radius:15px; background:rgba(34,197,94,.12); border:1px solid rgba(34,197,94,.32); color:#dcfce7; }}
@@ -5664,7 +5814,7 @@ def render_worldcup_map_html(champion_df, results_df, mc_df=None, training_resul
           .groups-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
           .dashboard-grid {{ grid-template-columns: 1fr; }}
           .bracket-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-          .ko-grid {{ grid-template-columns: repeat(5, minmax(170px, 1fr)); }}
+          .ko-official-grid {{ grid-template-columns: repeat(9, minmax(170px, 1fr)); }}
         }}
       </style>
       <div class="wc-header">
@@ -5681,18 +5831,13 @@ def render_worldcup_map_html(champion_df, results_df, mc_df=None, training_resul
         <span><i class="dot yellow"></i>Tercero / disputa</span>
         <span><i class="dot red"></i>Riesgo o eliminado</span>
       </div>
-      <div class="section-title">Favoritos y ruta proyectada</div>
-      <div class="dashboard-grid">
-        <div class="panel"><b>🔥 Favoritos actuales</b>{''.join(fav_html)}</div>
-        <div class="panel">
-          <b>🧩 Dieciseisavos proyectados estilo cuadro oficial</b>
-          <p style="color:#cbd5e1;font-size:12px;margin-top:6px;">Proyección educativa: se actualiza con resultados cargados y clasificados estimados. No reemplaza el bracket oficial FIFA ni asegura resultados.</p>
-          <div class="bracket-grid">{''.join(bracket_html)}</div>
-        </div>
+      <div class="section-title">Favoritos actuales</div>
+      <div class="dashboard-grid one-col">
+        <div class="panel"><b>🔥 Probabilidad estimada de campeón</b><p style="color:#cbd5e1;font-size:12px;margin-top:6px;">Los equipos eliminados se muestran con 0% y los equipos vivos se renormalizan al 100%.</p>{''.join(fav_html)}</div>
       </div>
       <div class="section-title">Mapa completo proyectado de eliminatorias</div>
       <div class="panel">
-        <p style="color:#cbd5e1;font-size:12px;margin-top:0;">Simulación fase por fase: dieciseisavos, octavos, cuartos, semifinal y final. Cada cruce usa el modelo 1X2 cuando está disponible y la probabilidad estimada de campeón como soporte estadístico.</p>
+        <p style="color:#cbd5e1;font-size:12px;margin-top:0;">Cuadro basado en la formación oficial cargada de la fase eliminatoria. Cada cruce pendiente usa el modelo 1X2 automático del versus; si ya existe resultado cargado, avanza el ganador real. Es una estimación estadística, no una garantía.</p>
         {complete_bracket_html}
       </div>
     </div>
@@ -8840,7 +8985,7 @@ def streamlit_app():
         admin_mode=admin_mode,
         details={
             "require_access": access_settings.get("require_access", False),
-            "privacy_version": "V41_MEJORAS_PRE_LANZAMIENTO",
+            "privacy_version": "V42_MAPA_FIFA_ELIMINADOS",
             "analytics_scope": "anonymous_events_only"
         },
         once_key="session_start"
@@ -9527,6 +9672,7 @@ def streamlit_app():
         if run_mc:
             with st.spinner("Simulando fase de grupos y eliminatorias..."):
                 mc_df = monte_carlo_worldcup(training_result, mem, results, n_simulations=n_mc, seed=RANDOM_STATE)
+            mc_df = apply_elimination_to_mc_probabilities(mc_df, results)
             st.session_state["mc_df"] = mc_df
             st.session_state["mc_n"] = n_mc
 
@@ -9536,7 +9682,7 @@ def streamlit_app():
                 st.metric("Favorito Monte Carlo", mc_df.iloc[0]["equipo_es"], f'{mc_df.iloc[0]["prob_campeon_montecarlo_%"]:.2f}%')
                 st.caption(
                     "La simulación usa resultados reales cargados y simula partidos faltantes. "
-                    "La llave de eliminatorias es aproximada por siembra de fuerza, no reemplaza el bracket oficial."
+                    "El mapa de eliminatorias usa el cuadro oficial cargado como base y proyecta cada versus con el modelo 1X2; no asegura resultados."
                 )
 
             mc_show = mc_df[["ranking_mc", "equipo_es", "prob_campeon_montecarlo_%", "campeon_simulaciones"]].copy()
@@ -9575,7 +9721,7 @@ def streamlit_app():
     with tab1:
         st.subheader("🗺️ Mapa profesional del Mundial")
         st.caption(
-            "Visualiza grupos, favoritos, ruta proyectada y estados del torneo. "
+            "Visualiza grupos, favoritos, eliminados en 0% y el cuadro completo de eliminatorias basado en la formación oficial cargada. "
             "Pasa el puntero sobre cada equipo o llave para ver información relevante."
         )
 
