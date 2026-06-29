@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V40_TRIAL_5_CONSULTAS_PRECIOS"
+MODEL_VERSION = "V41_MEJORAS_PRE_LANZAMIENTO"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -5186,6 +5186,81 @@ def compute_data_quality_index(auto_sources, advanced_context, prediction, mem, 
 
 
 
+
+
+def auto_refresh_worldcup_results_for_session(api_key="", min_year=2024, force=False):
+    """
+    V41: actualiza resultados del Mundial para que todos los partidos finalizados
+    disponibles aporten a tablas, precisión y mapa, sin reentrenar el modelo público.
+    Usa calendario interno, CSV manual, fuentes públicas gratuitas y API-Football si está configurada.
+    """
+    if not STREAMLIT_OK:
+        return 0, "Sin Streamlit"
+    if st.session_state.get("results") is None:
+        return 0, "Sin resultados base"
+    if st.session_state.get("v41_auto_refresh_done") and not force:
+        return 0, "Actualización V41 ya revisada en esta sesión"
+
+    try:
+        current_results = st.session_state.results.copy()
+        before_count = len(strict_completed_worldcup_matches(current_results))
+
+        sync_internal_wc_calendar(force_seed_update=True)
+        update_msg = ""
+        try:
+            free_results, update_msg = fetch_free_worldcup_results_range(
+                start_date="2026-06-11",
+                end_date=datetime.today().date(),
+                force=force
+            )
+            if free_results is not None and not free_results.empty:
+                update_internal_calendar_with_results(free_results, source_label="Fuente pública gratuita V41")
+                current_results = pd.concat([current_results, free_results], ignore_index=True)
+        except Exception as e:
+            update_msg = f"Fuente pública no disponible: {str(e)[:100]}"
+
+        internal_wc = load_internal_wc_results()
+        manual_wc = load_manual_wc_results()
+        if internal_wc is not None and not internal_wc.empty:
+            current_results = pd.concat([current_results, internal_wc], ignore_index=True)
+        if manual_wc is not None and not manual_wc.empty:
+            current_results = pd.concat([current_results, manual_wc], ignore_index=True)
+
+        if api_key:
+            try:
+                fixtures = fetch_worldcup_fixtures(api_key, force=force)
+                wc_results = api_fixtures_to_results(fixtures)
+                if wc_results is not None and not wc_results.empty:
+                    current_results = pd.concat([current_results, wc_results], ignore_index=True)
+                    update_msg = f"{update_msg} + API-Football: {len(wc_results)} partidos finalizados"
+            except Exception as e:
+                update_msg = f"{update_msg} + API no disponible: {str(e)[:90]}"
+
+        current_results = dedupe_results_by_match(current_results)
+        try:
+            current_results = replace_worldcup_results_with_canonical(current_results, force=force)
+        except Exception:
+            pass
+
+        try:
+            _, _, fresh_mem = build_features_from_results(current_results, min_year=min_year)
+            st.session_state.mem = fresh_mem
+        except Exception:
+            pass
+
+        st.session_state.results = current_results
+        st.session_state.v41_auto_refresh_done = True
+
+        after_count = len(strict_completed_worldcup_matches(current_results))
+        try:
+            save_worldcup_snapshot(current_results)
+        except Exception:
+            pass
+        return max(0, after_count - before_count), f"Mundial 2026 actualizado: {after_count} partidos finalizados cargados. {update_msg}"
+    except Exception as e:
+        st.session_state.v41_auto_refresh_done = True
+        return 0, f"No se pudo actualizar automáticamente: {str(e)[:160]}"
+
 # ============================================================
 # 6D. MAPA PROFESIONAL DEL MUNDIAL Y PRECISIÓN DEL MODELO
 # ============================================================
@@ -5336,10 +5411,123 @@ def build_projected_bracket_pairs(champion_df, results_df=None):
     return pd.DataFrame(rows)
 
 
-def render_worldcup_map_html(champion_df, results_df, mc_df=None):
+
+
+def pair_win_probability_for_bracket(team_a, team_b, champion_lookup, training_result=None, mem=None, results_df=None):
+    """Probabilidad de avance en eliminatoria usando modelo rápido si está disponible, con fallback por fuerza campeón."""
+    try:
+        if training_result is not None and mem is not None and results_df is not None:
+            pred = predict_outcome_probs_fast(training_result, mem, results_df, team_a, team_b)
+            probs = pred.get("probs", {})
+            pa90 = float(probs.get("victoria_A", 0.0))
+            pdra = float(probs.get("empate", 0.0))
+            pb90 = float(probs.get("victoria_B", 0.0))
+            strength_a = float(champion_lookup.get(team_a, 0.1))
+            strength_b = float(champion_lookup.get(team_b, 0.1))
+            t = max(0.0001, strength_a + strength_b)
+            pa = pa90 + pdra * (strength_a / t)
+            pb = pb90 + pdra * (strength_b / t)
+            total = max(0.0001, pa + pb)
+            return pa / total * 100.0, pb / total * 100.0, "modelo 1X2 + fuerza"
+    except Exception:
+        pass
+
+    sa = max(0.05, float(champion_lookup.get(team_a, 0.05)))
+    sb = max(0.05, float(champion_lookup.get(team_b, 0.05)))
+    total = sa + sb
+    return sa / total * 100.0, sb / total * 100.0, "fuerza campeón"
+
+
+def build_complete_knockout_projection(champion_df, results_df=None, training_result=None, mem=None):
+    """
+    Construye bracket completo: dieciseisavos, octavos, cuartos, semifinal y final.
+    Es una simulación estadística; no garantiza resultados ni reemplaza el cuadro oficial.
+    """
+    if champion_df is None or champion_df.empty:
+        return pd.DataFrame()
+
+    champion_lookup = champion_df.set_index("equipo")["prob_campeon_%"].to_dict()
+    r32 = build_projected_bracket_pairs(champion_df, results_df)
+    if r32 is None or r32.empty:
+        return pd.DataFrame()
+
+    rounds = ["Dieciseisavos", "Octavos", "Cuartos", "Semifinal", "Final"]
+    current_pairs = [(row["equipo_a"], row["equipo_b"]) for _, row in r32.iterrows()]
+    all_rows = []
+
+    for round_idx, round_name in enumerate(rounds, start=1):
+        winners = []
+        for match_idx, (a, b) in enumerate(current_pairs, start=1):
+            pa, pb, source = pair_win_probability_for_bracket(a, b, champion_lookup, training_result, mem, results_df)
+            winner = a if pa >= pb else b
+            winners.append(winner)
+            all_rows.append({
+                "fase": round_name,
+                "orden_fase": round_idx,
+                "partido": match_idx,
+                "equipo_a": a,
+                "equipo_b": b,
+                "equipo_a_es": TEAM_NAME_ES.get(a, a),
+                "equipo_b_es": TEAM_NAME_ES.get(b, b),
+                "flag_a": TEAM_FLAGS.get(a, "🏳️"),
+                "flag_b": TEAM_FLAGS.get(b, "🏳️"),
+                "prob_a_avanza_%": round(pa, 1),
+                "prob_b_avanza_%": round(pb, 1),
+                "ganador_estimado": winner,
+                "ganador_estimado_es": TEAM_NAME_ES.get(winner, winner),
+                "fuente_prob": source,
+            })
+        current_pairs = []
+        for i in range(0, len(winners), 2):
+            if i + 1 < len(winners):
+                current_pairs.append((winners[i], winners[i + 1]))
+        if not current_pairs:
+            break
+
+    return pd.DataFrame(all_rows)
+
+
+def render_complete_knockout_html(bracket_df):
+    if bracket_df is None or bracket_df.empty:
+        return "<p style='color:#cbd5e1'>No hay datos suficientes para construir el bracket completo.</p>"
+
+    columns = []
+    for fase in ["Dieciseisavos", "Octavos", "Cuartos", "Semifinal", "Final"]:
+        d = bracket_df[bracket_df["fase"] == fase].copy()
+        cards = []
+        for _, r in d.iterrows():
+            cards.append(f'''
+              <div class="ko-card" title="{r['fuente_prob']} · Ganador estimado: {r['ganador_estimado_es']}">
+                <div class="ko-match-title">{fase} · P{int(r['partido'])}</div>
+                <div class="ko-team {'winner' if r['ganador_estimado']==r['equipo_a'] else ''}"><span>{r['flag_a']} <b>{r['equipo_a_es']}</b></span><small>{float(r['prob_a_avanza_%']):.1f}%</small></div>
+                <div class="versus">vs</div>
+                <div class="ko-team {'winner' if r['ganador_estimado']==r['equipo_b'] else ''}"><span>{r['flag_b']} <b>{r['equipo_b_es']}</b></span><small>{float(r['prob_b_avanza_%']):.1f}%</small></div>
+              </div>
+            ''')
+        columns.append(f'''
+          <div class="ko-col">
+            <div class="ko-title">{fase}</div>
+            {''.join(cards)}
+          </div>
+        ''')
+
+    champion = bracket_df[bracket_df["fase"] == "Final"]
+    champion_txt = ""
+    if not champion.empty:
+        w = champion.iloc[0]["ganador_estimado_es"]
+        champion_txt = f"<div class='champion-box'>🏆 Ganador estadístico proyectado: <b>{w}</b><br><small>Estimación basada en datos disponibles; no garantiza resultados.</small></div>"
+
+    return f"""
+      {champion_txt}
+      <div class="ko-grid">{''.join(columns)}</div>
+    """
+
+def render_worldcup_map_html(champion_df, results_df, mc_df=None, training_result=None, mem=None):
     """Renderiza un mapa/dashboard interactivo en HTML."""
     tables = get_worldcup_group_tables_from_calendar(results_df)
     bracket = build_projected_bracket_pairs(champion_df, results_df)
+    complete_bracket = build_complete_knockout_projection(champion_df, results_df, training_result=training_result, mem=mem)
+    complete_bracket_html = render_complete_knockout_html(complete_bracket)
 
     fav_df = champion_df.copy()
     if mc_df is not None and not mc_df.empty:
@@ -5443,6 +5631,14 @@ def render_worldcup_map_html(champion_df, results_df, mc_df=None):
         .bar {{ height:8px; background:rgba(255,255,255,.13); border-radius:99px; overflow:hidden; margin-top:6px; }}
         .bar span {{ display:block; height:100%; background:linear-gradient(90deg,#22c55e,#38bdf8); border-radius:99px; }}
         .bracket-grid {{ display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:10px; }}
+        .ko-grid {{ display:grid; grid-template-columns: repeat(5, minmax(170px, 1fr)); gap:12px; overflow-x:auto; padding-bottom:8px; }}
+        .ko-col {{ min-width:170px; }}
+        .ko-title {{ color:#fef3c7; font-weight:900; margin:10px 0; text-transform:uppercase; font-size:12px; letter-spacing:.05em; }}
+        .ko-card {{ background:rgba(2,6,23,.48); border:1px solid rgba(148,163,184,.24); border-radius:15px; padding:10px; margin-bottom:10px; }}
+        .ko-match-title {{ color:#93c5fd; font-size:11px; font-weight:800; margin-bottom:8px; }}
+        .ko-team {{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:7px; border-radius:11px; background:rgba(255,255,255,.07); font-size:12px; }}
+        .ko-team.winner {{ border-left:4px solid #22c55e; background:rgba(34,197,94,.12); }}
+        .champion-box {{ margin:10px 0 14px; padding:12px; border-radius:15px; background:rgba(34,197,94,.12); border:1px solid rgba(34,197,94,.32); color:#dcfce7; }}
         .match-card {{ background:rgba(2,6,23,.44); border:1px solid rgba(148,163,184,.24); border-radius:15px; padding:10px; }}
         .match-card:hover {{ border-color:#38bdf8; }}
         .match-title {{ color:#fef3c7; font-size:11px; font-weight:800; margin-bottom:8px; text-transform:uppercase; letter-spacing:.04em; }}
@@ -5457,6 +5653,7 @@ def render_worldcup_map_html(champion_df, results_df, mc_df=None):
           .groups-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
           .dashboard-grid {{ grid-template-columns: 1fr; }}
           .bracket-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+          .ko-grid {{ grid-template-columns: repeat(5, minmax(170px, 1fr)); }}
         }}
       </style>
       <div class="wc-header">
@@ -5477,10 +5674,15 @@ def render_worldcup_map_html(champion_df, results_df, mc_df=None):
       <div class="dashboard-grid">
         <div class="panel"><b>🔥 Favoritos actuales</b>{''.join(fav_html)}</div>
         <div class="panel">
-          <b>🧩 Eliminatoria proyectada aproximada</b>
-          <p style="color:#cbd5e1;font-size:12px;margin-top:6px;">Proyección educativa: cruza 32 clasificados estimados por fuerza. No reemplaza el bracket oficial FIFA.</p>
+          <b>🧩 Dieciseisavos proyectados estilo cuadro oficial</b>
+          <p style="color:#cbd5e1;font-size:12px;margin-top:6px;">Proyección educativa: se actualiza con resultados cargados y clasificados estimados. No reemplaza el bracket oficial FIFA ni asegura resultados.</p>
           <div class="bracket-grid">{''.join(bracket_html)}</div>
         </div>
+      </div>
+      <div class="section-title">Mapa completo proyectado de eliminatorias</div>
+      <div class="panel">
+        <p style="color:#cbd5e1;font-size:12px;margin-top:0;">Simulación fase por fase: dieciseisavos, octavos, cuartos, semifinal y final. Cada cruce usa el modelo 1X2 cuando está disponible y la probabilidad estimada de campeón como soporte estadístico.</p>
+        {complete_bracket_html}
       </div>
     </div>
     """
@@ -6148,7 +6350,7 @@ def load_analytics_events(limit=None):
 
 
 def summarize_analytics(df):
-    """Resumen de visitas anónimas."""
+    """Resumen de visitas anónimas con días acumulados desde la primera visita."""
     if df is None or df.empty:
         return {
             "sessions": 0,
@@ -6157,14 +6359,32 @@ def summarize_analytics(df):
             "access_granted": 0,
             "admin_sessions": 0,
             "days": 0,
+            "active_days": 0,
+            "first_day": "",
         }
+
+    active_days = int(df["date"].nunique()) if "date" in df else 0
+    cumulative_days = active_days
+    first_day = ""
+    try:
+        dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+        if not dates.empty:
+            first = dates.min().normalize()
+            last = max(dates.max().normalize(), pd.Timestamp.utcnow().normalize())
+            cumulative_days = int((last - first).days) + 1
+            first_day = first.date().isoformat()
+    except Exception:
+        pass
+
     return {
         "sessions": int(df["session_id"].nunique()) if "session_id" in df else 0,
         "events": int(len(df)),
         "paywall_views": int((df.get("event_type") == "paywall_view").sum()) if "event_type" in df else 0,
         "access_granted": int((df.get("event_type") == "access_granted").sum()) if "event_type" in df else 0,
         "admin_sessions": int(df.loc[df.get("admin_mode", 0).astype(str).isin(["1", "True", "true"]), "session_id"].nunique()) if "admin_mode" in df and "session_id" in df else 0,
-        "days": int(df["date"].nunique()) if "date" in df else 0,
+        "days": cumulative_days,
+        "active_days": active_days,
+        "first_day": first_day,
     }
 
 
@@ -6192,7 +6412,7 @@ def render_analytics_dashboard():
     c2.metric("Eventos totales", summary["events"])
     c3.metric("Vistas paywall", summary["paywall_views"])
     c4.metric("Accesos aprobados", summary["access_granted"])
-    c5.metric("Días registrados", summary["days"])
+    c5.metric("Días acumulados", summary["days"], help="Días corridos desde la primera visita registrada. Días activos con eventos: %s" % summary.get("active_days", 0))
 
     st.markdown("### Visitas por día")
     daily = (
@@ -6977,7 +7197,7 @@ def ensure_default_coupon():
                 (code, price_usd, discount_usd, active, max_uses, uses, expires_at, created_at, notes)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                ("BETA-TIKTOK-2026", 10900.0, 4000.0, 1, 200, 0, None, now, "Cupón promocional beta: precio COP 10.900")
+                ("BETA-TIKTOK-2026", 15900.0, 4000.0, 1, 200, 0, None, now, "Cupón promocional beta: precio COP 15.900")
             )
             con.commit()
     except Exception:
@@ -7042,7 +7262,7 @@ def increment_coupon_use(code):
         pass
 
 
-def create_coupon(code, price_usd=4.0, max_uses=100, notes=""):
+def create_coupon(code, price_usd=15900.0, max_uses=100, notes=""):
     init_access_control_db()
     code = str(code or "").strip().upper().replace(" ", "-")
     if not code:
@@ -7056,7 +7276,7 @@ def create_coupon(code, price_usd=4.0, max_uses=100, notes=""):
                 (code, price_usd, discount_usd, active, max_uses, uses, expires_at, created_at, notes)
                 VALUES (?, ?, ?, ?, ?, COALESCE((SELECT uses FROM coupons WHERE code = ?), 0), ?, ?, ?)
                 """,
-                (code, float(price_usd), max(0.0, 5.0 - float(price_usd)), 1, int(max_uses), code, None, now, str(notes or ""))
+                (code, float(price_usd), max(0.0, 19900.0 - float(price_usd)), 1, int(max_uses), code, None, now, str(notes or ""))
             )
             con.commit()
         log_access_event("coupon_created", details={"code": code, "price_usd": price_usd, "max_uses": max_uses})
@@ -7113,9 +7333,9 @@ def get_customer(email):
 
 def get_trial_max_queries():
     try:
-        return max(1, int(str(get_config_value("TRIAL_MAX_CONSULTAS", "5")).strip()))
+        return max(1, int(str(get_config_value("TRIAL_MAX_CONSULTAS", "2")).strip()))
     except Exception:
-        return 5
+        return 2
 
 
 def normalize_match_query_key(team_a, team_b):
@@ -7209,7 +7429,7 @@ def register_trial_query(email, team_a, team_b, details=None):
 def check_and_register_trial_query(team_a, team_b):
     """
     Para usuarios de prueba:
-    - permite máximo 5 consultas por correo,
+    - permite máximo 2 consultas por correo,
     - una consulta se define como un partido/equipos analizados,
     - repetir el mismo partido no descuenta otra consulta.
     """
@@ -7424,8 +7644,8 @@ def mercadopago_settings():
     return {
         "access_token": str(get_config_value("MERCADOPAGO_ACCESS_TOKEN", "") or "").strip(),
         "currency": str(get_config_value("MERCADOPAGO_CURRENCY", "COP") or "COP").strip().upper(),
-        "base_price": float(str(get_config_value("MERCADOPAGO_BASE_PRICE", "14900")).replace(",", ".") or 14900),
-        "coupon_price": float(str(get_config_value("MERCADOPAGO_COUPON_PRICE", "10900")).replace(",", ".") or 10900),
+        "base_price": float(str(get_config_value("MERCADOPAGO_BASE_PRICE", "19900")).replace(",", ".") or 19900),
+        "coupon_price": float(str(get_config_value("MERCADOPAGO_COUPON_PRICE", "15900")).replace(",", ".") or 15900),
         "public_url": str(get_config_value("APP_PUBLIC_URL", "https://predictor-mundial-2026-edp.streamlit.app/") or "").strip().rstrip("/"),
         "sandbox": str(get_config_value("MERCADOPAGO_SANDBOX", "false")).lower().strip() in ["1", "true", "yes", "si", "sí", "on"],
     }
@@ -7820,7 +8040,7 @@ def render_access_admin_dashboard():
         with c2:
             paid_coupon = st.text_input("Cupón usado", key="admin_paid_coupon")
         with c3:
-            paid_price = st.number_input("Precio COP", min_value=0.0, value=14900.0, step=1000.0, key="admin_paid_price")
+            paid_price = st.number_input("Precio COP", min_value=0.0, value=19900.0, step=1000.0, key="admin_paid_price")
         paid_notes = st.text_input("Notas internas", key="admin_paid_notes")
         if st.button("Guardar cliente pagado", use_container_width=True):
             ok, msg = register_paid_customer(paid_email, paid_coupon, paid_price, paid_notes)
@@ -7832,7 +8052,7 @@ def render_access_admin_dashboard():
         try:
             with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
                 df_customers = pd.read_sql_query(
-                    "SELECT email, status, trial_used, COALESCE(trial_queries_used, 0) AS trial_queries_used, COALESCE(trial_max_queries, 5) AS trial_max_queries, coupon_code, price_usd, created_at, last_login_at, total_logins, notes FROM customers ORDER BY updated_at DESC",
+                    "SELECT email, status, trial_used, COALESCE(trial_queries_used, 0) AS trial_queries_used, COALESCE(trial_max_queries, 2) AS trial_max_queries, coupon_code, price_usd, created_at, last_login_at, total_logins, notes FROM customers ORDER BY updated_at DESC",
                     con
                 )
             if not df_customers.empty:
@@ -7855,7 +8075,7 @@ def render_access_admin_dashboard():
         with c1:
             coupon_code = st.text_input("Código cupón", value="BETA-TIKTOK-2026", key="admin_coupon_code")
         with c2:
-            coupon_price = st.number_input("Precio con cupón COP", min_value=0.0, value=10900.0, step=1000.0, key="admin_coupon_price")
+            coupon_price = st.number_input("Precio con cupón COP", min_value=0.0, value=15900.0, step=1000.0, key="admin_coupon_price")
         with c3:
             coupon_uses = st.number_input("Usos máximos", min_value=1, value=200, step=10, key="admin_coupon_uses")
         coupon_notes = st.text_input("Notas cupón", value="Campaña promocional", key="admin_coupon_notes")
@@ -8092,7 +8312,7 @@ def render_public_landing(settings):
     with tab_trial:
         st.subheader("Prueba gratuita")
         st.caption(
-            "La prueba gratuita permite 5 consultas por correo. "
+            "La prueba gratuita permite 2 consultas por correo. "
             "Recibirás un código dinámico que vence en 10 minutos."
         )
         trial_email = st.text_input("Correo para recibir el código gratuito", key="trial_email")
@@ -8609,7 +8829,7 @@ def streamlit_app():
         admin_mode=admin_mode,
         details={
             "require_access": access_settings.get("require_access", False),
-            "privacy_version": "V40_TRIAL_5_CONSULTAS_PRECIOS",
+            "privacy_version": "V41_MEJORAS_PRE_LANZAMIENTO",
             "analytics_scope": "anonymous_events_only"
         },
         once_key="session_start"
@@ -8833,6 +9053,16 @@ def streamlit_app():
     results = st.session_state.results
     mem = st.session_state.mem
     api_status = st.session_state.api_status
+
+    # V41: en cada sesión revisa resultados mundialistas nuevos sin dañar el modelo ni reentrenar públicamente.
+    try:
+        added_wc, refresh_msg = auto_refresh_worldcup_results_for_session(api_key=api_key, min_year=st.session_state.min_year or min_year, force=force_update and admin_mode)
+        results = st.session_state.results
+        mem = st.session_state.mem
+        if refresh_msg and (admin_mode or added_wc > 0):
+            st.caption("🔄 " + refresh_msg)
+    except Exception:
+        pass
 
     if admin_mode:
         st.success(api_status)
@@ -9178,6 +9408,18 @@ def streamlit_app():
 
     st.divider()
 
+    with st.expander("ℹ️ ¿Para qué sirve cada pestaña?", expanded=False):
+        st.markdown("""
+        - **Campeón Mundial:** ranking de probabilidad estimada de campeón y simulación Monte Carlo.
+        - **Mapa del Mundial:** grupos, clasificados proyectados y ruta de eliminatorias completa simulada.
+        - **Precisión:** auditoría de aciertos del modelo con partidos ya jugados.
+        - **Modelos / Matrices / Peso de variables:** secciones técnicas para validar cómo trabaja el modelo.
+        - **Datos del partido:** variables usadas para el análisis del encuentro seleccionado.
+        - **Privacidad:** qué datos se guardan y qué datos no se guardan.
+        - **Analítica:** visitas, accesos, cupones y eventos administrativos.
+        """)
+        st.caption("Todas las probabilidades son estimaciones estadísticas educativas. No garantizan resultados.")
+
     if admin_mode:
         tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
             tr("tabs_champion", lang),
@@ -9310,12 +9552,12 @@ def streamlit_app():
 
         champion_df_for_map = estimate_champion_probabilities(mem, results, WC_2026_TEAMS)
         mc_df_for_map = st.session_state.get("mc_df", None)
-        map_html = render_worldcup_map_html(champion_df_for_map, results, mc_df=mc_df_for_map)
-        components.html(map_html, height=1450, scrolling=True)
+        map_html = render_worldcup_map_html(champion_df_for_map, results, mc_df=mc_df_for_map, training_result=training_result, mem=mem)
+        components.html(map_html, height=2200, scrolling=True)
 
         st.info(
             "La ruta eliminatoria mostrada es una proyección educativa con los clasificados estimados. "
-            "Cuando el calendario oficial de eliminatorias esté completamente definido, se puede conectar a una llave oficial."
+            "El mapa completo es una simulación estadística fase por fase. Cuando la llave oficial esté confirmada, se puede alimentar con ese orden exacto."
         )
 
     with tab2:
