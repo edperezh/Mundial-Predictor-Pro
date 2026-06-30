@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V44_NEQUI_FEEDBACK_PRECISION"
+MODEL_VERSION = "V45_NEQUI_RAPIDO_DARK_ADMIN"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -7442,7 +7442,7 @@ def nequi_settings():
         "enabled": enabled_raw in ["1", "true", "yes", "si", "sí"],
         "phone": str(get_config_value("NEQUI_PHONE", "") or "").strip(),
         "holder": str(get_config_value("NEQUI_HOLDER", "") or "").strip(),
-        "instructions": str(get_config_value("NEQUI_INSTRUCTIONS", "Envía el pago por Nequi y luego registra tu correo y referencia para verificación manual.") or "").strip(),
+        "instructions": str(get_config_value("NEQUI_INSTRUCTIONS", "Envía el pago por Nequi y luego registra tu correo y referencia para verificación manual. La verificación puede tardar un poco más porque es un proceso manual.") or "").strip(),
     }
 
 
@@ -7494,7 +7494,7 @@ def register_nequi_payment_request(email, amount, currency="COP", coupon_code=""
             admin_mode=bool(st.session_state.get("admin_mode", False)) if STREAMLIT_OK else False,
             details={"amount": amount, "currency": currency, "coupon": coupon_code},
         )
-        return True, "Solicitud registrada. El acceso se activa después de verificar el pago real. Revisa tu correo y también Spam/Promociones."
+        return True, "Solicitud registrada. El acceso se activa después de verificar el pago real. Como Nequi es manual, la verificación puede tardar un poco más. Revisa tu correo y también Spam/Promociones."
     except Exception as e:
         return False, str(e)[:180]
 
@@ -8428,6 +8428,70 @@ def render_screen_protection():
         pass
 
 
+
+def approve_nequi_payment_request(payment_id, notes=""):
+    """Aprueba manualmente un pago Nequi y activa el correo como cliente pagado."""
+    init_access_control_db()
+    try:
+        payment_id_int = int(payment_id)
+    except Exception:
+        return False, "ID de pago inválido."
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                """
+                SELECT * FROM payments
+                WHERE id=? AND provider='nequi_manual'
+                """,
+                (payment_id_int,)
+            ).fetchone()
+            if not row:
+                return False, "No se encontró ese pago Nequi."
+            data = dict(row)
+            if str(data.get("status", "")).lower() == "approved":
+                return False, "Ese pago Nequi ya estaba aprobado."
+            email = normalize_email(data.get("email", ""))
+            if not is_valid_email(email):
+                return False, "El pago no tiene un correo válido."
+            con.execute(
+                "UPDATE payments SET status='approved', raw_summary=? WHERE id=?",
+                (json.dumps({"manual_approval": True, "approved_at": datetime.utcnow().isoformat(timespec="seconds"), "notes": str(notes or "")}, ensure_ascii=False), payment_id_int)
+            )
+            con.commit()
+        ok, msg = register_paid_customer(
+            email,
+            data.get("coupon_code", ""),
+            float(data.get("amount") or 0),
+            f"Pago Nequi verificado manualmente. Ref: {data.get('external_reference', '')}. {notes or ''}"
+        )
+        if ok:
+            log_access_event("nequi_manual_payment_approved", email=email, details={"payment_id": payment_id_int, "amount": data.get("amount"), "currency": data.get("currency")})
+            return True, f"Pago Nequi aprobado y cliente activado: {email}"
+        return False, msg
+    except Exception as e:
+        return False, str(e)[:180]
+
+
+def reject_nequi_payment_request(payment_id, notes=""):
+    """Marca una solicitud Nequi como rechazada/no comprobada."""
+    init_access_control_db()
+    try:
+        payment_id_int = int(payment_id)
+    except Exception:
+        return False, "ID de pago inválido."
+    try:
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            con.execute(
+                "UPDATE payments SET status='rejected', raw_summary=? WHERE id=? AND provider='nequi_manual'",
+                (json.dumps({"manual_rejection": True, "rejected_at": datetime.utcnow().isoformat(timespec="seconds"), "notes": str(notes or "")}, ensure_ascii=False), payment_id_int)
+            )
+            con.commit()
+        log_access_event("nequi_manual_payment_rejected", details={"payment_id": payment_id_int, "notes": str(notes or "")[:120]})
+        return True, f"Solicitud Nequi {payment_id_int} marcada como rechazada/no comprobada."
+    except Exception as e:
+        return False, str(e)[:180]
+
 def render_access_admin_dashboard():
     """Panel admin para clientes, cupones y eventos de acceso."""
     st.markdown("### 👥 Accesos, clientes y cupones")
@@ -8440,7 +8504,7 @@ def render_access_admin_dashboard():
         st.error("No se pudo iniciar la base de accesos.")
         return
 
-    tab_clients, tab_coupons, tab_payments, tab_events = st.tabs(["Clientes", "Cupones", "Pagos automáticos", "Eventos de acceso"])
+    tab_clients, tab_coupons, tab_payments, tab_nequi, tab_events = st.tabs(["Clientes", "Cupones", "Pagos automáticos", "Nequi manual", "Eventos de acceso"])
 
     with tab_clients:
         st.markdown("#### Registrar cliente pagado")
@@ -8552,6 +8616,65 @@ def render_access_admin_dashboard():
         except Exception as e:
             st.error(f"No se pudo cargar pagos: {e}")
 
+    with tab_nequi:
+        st.markdown("#### Pagos Nequi pendientes de verificación")
+        st.caption(
+            "Nequi es manual: primero confirma el movimiento real en tu app de Nequi. "
+            "Después aprueba aquí el ID para activar el correo como cliente pagado."
+        )
+        try:
+            with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+                df_nequi = pd.read_sql_query(
+                    """
+                    SELECT id, status, email, amount, currency, coupon_code, external_reference, created_at
+                    FROM payments
+                    WHERE provider='nequi_manual'
+                    ORDER BY id DESC
+                    LIMIT 300
+                    """,
+                    con
+                )
+            if not df_nequi.empty:
+                show_nequi = df_nequi.copy()
+                if "email" in show_nequi.columns:
+                    show_nequi["email"] = show_nequi["email"].map(mask_email)
+                st.dataframe(safe_streamlit_df(show_nequi), use_container_width=True, hide_index=True)
+                pending_ids = df_nequi[df_nequi["status"].astype(str).str.lower().eq("pending_review")]["id"].astype(int).tolist()
+                if pending_ids:
+                    st.info("Para activar un cliente: confirma el pago real en Nequi, selecciona el ID y presiona aprobar.")
+                    pay_id = st.selectbox("ID de pago Nequi pendiente", pending_ids, key="admin_nequi_payment_id")
+                    approve_notes = st.text_input("Notas de verificación", placeholder="Ej: pago confirmado en Nequi", key="admin_nequi_notes")
+                    c_ap, c_rej = st.columns(2)
+                    with c_ap:
+                        if st.button("✅ Aprobar Nequi y activar cliente", use_container_width=True):
+                            ok, msg = approve_nequi_payment_request(pay_id, approve_notes)
+                            if ok:
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+                    with c_rej:
+                        if st.button("❌ Marcar como no comprobado", use_container_width=True):
+                            ok, msg = reject_nequi_payment_request(pay_id, approve_notes)
+                            if ok:
+                                st.warning(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+                else:
+                    st.success("No hay pagos Nequi pendientes.")
+                st.download_button(
+                    "⬇️ Descargar pagos Nequi CSV",
+                    data=df_nequi.to_csv(index=False).encode("utf-8"),
+                    file_name="pagos_nequi_manual.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.info("Aún no hay solicitudes Nequi registradas.")
+        except Exception as e:
+            st.error(f"No se pudo cargar pagos Nequi: {e}")
+
     with tab_events:
         try:
             with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
@@ -8623,8 +8746,9 @@ def render_inline_purchase_section(default_email="", coupon_code=""):
         price = mp_cfg["coupon_price"] if coupon else mp_cfg["base_price"]
         purchase_email_inline = st.text_input(
             "Correo para recibir el link de Mercado Pago",
-            value=normalize_email(default_email),
-            key="inline_mp_purchase_email"
+            value="",
+            placeholder="tu_correo@ejemplo.com",
+            key="inline_mp_purchase_email_v45"
         )
         st.caption(f"Precio en checkout: **{format_money(price, mp_cfg['currency'])}**")
         if st.button("Generar enlace de pago con Mercado Pago", type="primary", use_container_width=True, key="inline_generate_mp_link"):
@@ -8666,12 +8790,12 @@ def render_inline_purchase_section(default_email="", coupon_code=""):
     if nequi_is_configured():
         st.divider()
         st.markdown("#### Pago manual por Nequi")
-        st.info("El pago por Nequi es manual: el acceso se activa únicamente después de verificar el pago real.")
+        st.info("El pago por Nequi es manual: el acceso se activa únicamente después de verificar el pago real. La revisión puede tardar un poco más que Mercado Pago.")
         st.write(f"**Número Nequi:** {nequi_cfg['phone']}")
         if nequi_cfg.get("holder"):
             st.caption(f"Titular: {nequi_cfg['holder']}")
         st.caption(nequi_cfg.get("instructions", ""))
-        nequi_email_inline = st.text_input("Correo para asociar pago Nequi", value=normalize_email(default_email), key="inline_nequi_email")
+        nequi_email_inline = st.text_input("Correo para asociar pago Nequi", value="", placeholder="tu_correo@ejemplo.com", key="inline_nequi_email_v45")
         nequi_ref_inline = st.text_input("Referencia, nota o últimos 4 dígitos del movimiento", key="inline_nequi_ref")
         nequi_amount_inline = mp_cfg["coupon_price"] if coupon else mp_cfg["base_price"]
         st.caption(f"Valor a enviar por Nequi: **{format_money(nequi_amount_inline, mp_cfg['currency'])}**")
@@ -8894,7 +9018,7 @@ def render_public_landing(settings):
         mp_cfg = mercadopago_settings()
         if mercadopago_is_configured():
             st.markdown("#### Recibe tu link seguro de Mercado Pago")
-            purchase_email = st.text_input("Correo para recibir el link de Mercado Pago", key="mp_purchase_email")
+            purchase_email = st.text_input("Correo para recibir el link de Mercado Pago", value="", placeholder="tu_correo@ejemplo.com", key="mp_purchase_email_v45")
             mp_amount = mp_cfg["coupon_price"] if coupon else mp_cfg["base_price"]
             st.caption(f"Precio en checkout: **{format_money(mp_amount, mp_cfg['currency'])}**")
 
@@ -8934,13 +9058,13 @@ def render_public_landing(settings):
         if nequi_available:
             st.divider()
             st.markdown("#### Pago manual por Nequi")
-            st.info("Nequi es una opción manual. El acceso no se activa automáticamente: primero se verifica el pago real.")
+            st.info("Nequi es una opción manual. El acceso no se activa automáticamente: primero se verifica el pago real. La revisión puede tardar un poco más que Mercado Pago.")
             nequi_cfg = nequi_settings()
             st.write(f"**Número Nequi:** {nequi_cfg['phone']}")
             if nequi_cfg.get("holder"):
                 st.caption(f"Titular: {nequi_cfg['holder']}")
             st.caption(nequi_cfg.get("instructions", ""))
-            nequi_email = st.text_input("Correo para asociar el pago Nequi", key="nequi_purchase_email")
+            nequi_email = st.text_input("Correo para asociar el pago Nequi", value="", placeholder="tu_correo@ejemplo.com", key="nequi_purchase_email_v45")
             nequi_reference = st.text_input("Referencia, nota o últimos 4 dígitos del movimiento", key="nequi_reference")
             st.caption(f"Valor a enviar por Nequi: **{format_money(final_price, display_currency)}**")
             if st.button("Registrar pago Nequi para verificación", use_container_width=True, key="nequi_register_payment"):
@@ -9342,7 +9466,7 @@ def streamlit_app():
         admin_mode=admin_mode,
         details={
             "require_access": access_settings.get("require_access", False),
-            "privacy_version": "V43_PRUEBA_UNA_VEZ_EJECUCION_MANUAL",
+            "privacy_version": "V45_NEQUI_RAPIDO_DARK_ADMIN",
             "analytics_scope": "anonymous_events_only"
         },
         once_key="session_start"
@@ -9567,13 +9691,24 @@ def streamlit_app():
     mem = st.session_state.mem
     api_status = st.session_state.api_status
 
-    # V41: en cada sesión revisa resultados mundialistas nuevos sin dañar el modelo ni reentrenar públicamente.
+    # V45: para que el análisis de versus cargue rápido, no se actualizan fuentes externas en cada rerun.
+    # El administrador puede forzar actualización desde el panel interno; el público usa el snapshot/modelo guardado.
     try:
-        added_wc, refresh_msg = auto_refresh_worldcup_results_for_session(api_key=api_key, min_year=st.session_state.min_year or min_year, force=force_update and admin_mode)
-        results = st.session_state.results
-        mem = st.session_state.mem
-        if refresh_msg and (admin_mode or added_wc > 0):
-            st.caption("🔄 " + refresh_msg)
+        public_auto_refresh = str(get_config_value("AUTO_REFRESH_PUBLIC_RESULTS", "false") or "false").lower().strip() in ["1", "true", "yes", "si", "sí", "on"]
+        should_refresh_session = (admin_mode and force_update) or ((not admin_mode) and public_auto_refresh)
+        if should_refresh_session and not st.session_state.get("v45_auto_refresh_done_once"):
+            added_wc, refresh_msg = auto_refresh_worldcup_results_for_session(
+                api_key=api_key,
+                min_year=st.session_state.min_year or min_year,
+                force=bool(admin_mode and force_update)
+            )
+            st.session_state["v45_auto_refresh_done_once"] = True
+            results = st.session_state.results
+            mem = st.session_state.mem
+            if refresh_msg and (admin_mode or added_wc > 0):
+                st.caption("🔄 " + refresh_msg)
+        elif admin_mode and force_update:
+            st.caption("⚡ Actualización externa ya ejecutada una vez en esta sesión. Desmarca y vuelve a marcar si necesitas repetirla.")
     except Exception:
         pass
 
@@ -9703,8 +9838,8 @@ def streamlit_app():
         match_date=default_match_date_tmp,
         internal_fixture=detected_fixture,
         force=False,
-        use_api=bool(api_key),
-        use_public=True
+        use_api=False,
+        use_public=False
     )
 
     default_venue = pre_venue_resolution.get("venue_key")
@@ -9780,11 +9915,11 @@ def streamlit_app():
                 "La app intentó resolverla por internet; si no hay fuente exacta, usa una sede de referencia."
             )
 
-        usar_auto_web = st.checkbox("Usar actualización automática desde internet", value=True)
+        usar_auto_web = st.checkbox("Usar variables externas desde internet (más lento)", value=False, help="Actívalo solo si necesitas clima/noticias/API en vivo. En modo rápido la predicción usa datos guardados y variables locales.")
         force_context_update = st.checkbox("Forzar actualización de variables externas", value=False)
 
         if usar_auto_web:
-            with st.spinner("Consultando clima, noticias, alineaciones y lesiones..."):
+            with st.spinner("Consultando variables externas. Esto puede tardar más que el modo rápido..."):
                 advanced_context, auto_sources = auto_fetch_advanced_context(
                     api_key=api_key,
                     team_a=team_a,
