@@ -122,7 +122,7 @@ WORLD_CUP_SEASON = 2026
 
 RANDOM_STATE = 42
 SEED = RANDOM_STATE
-MODEL_VERSION = "V45_NEQUI_RAPIDO_DARK_ADMIN"
+MODEL_VERSION = "V46_ELIMINADOS_CONSISTENCIA"
 OFFICIAL_MODEL_NAME = "Logistic Regression calibrada"
 
 # Reproducibilidad global: reduce variaciones entre ejecuciones.
@@ -1148,6 +1148,10 @@ def espn_scoreboard_to_results(data):
             hs = int(float(home.get("score", 0)))
             aw = int(float(away.get("score", 0)))
 
+            home_winner = bool(home.get("winner", False))
+            away_winner = bool(away.get("winner", False))
+            winner_team = home_team if home_winner else away_team if away_winner else ""
+
             rows.append({
                 "date": str(ev.get("date", ""))[:10],
                 "home_team": home_team,
@@ -1158,6 +1162,10 @@ def espn_scoreboard_to_results(data):
                 "city": "",
                 "country": "",
                 "neutral": True,
+                "winner_team": winner_team,
+                "home_winner": home_winner,
+                "away_winner": away_winner,
+                "source": "ESPN público",
             })
         except Exception:
             continue
@@ -1205,6 +1213,10 @@ def espn_scoreboard_to_events(data):
             hs = pd.to_numeric(home.get("score", None), errors="coerce")
             aw = pd.to_numeric(away.get("score", None), errors="coerce")
 
+            home_winner = bool(home.get("winner", False))
+            away_winner = bool(away.get("winner", False))
+            winner_team = home_team if home_winner else away_team if away_winner else ""
+
             rows.append({
                 "fixture_id": pd.to_numeric(ev.get("id", None), errors="coerce"),
                 "date": str(ev.get("date", ""))[:10],
@@ -1219,6 +1231,9 @@ def espn_scoreboard_to_events(data):
                 "city": "",
                 "country": "",
                 "neutral": True,
+                "winner_team": winner_team,
+                "home_winner": home_winner,
+                "away_winner": away_winner,
                 "source": "ESPN público",
             })
         except Exception:
@@ -1298,10 +1313,19 @@ def automatic_worldcup_public_count(force=False):
         # Solo los finalizados alimentan el modelo.
         completed_df = completed.dropna(subset=["home_score", "away_score"]).copy()
         if not completed_df.empty:
-            completed_df = clean_results_df(completed_df[[
+            base_cols = [
                 "date", "home_team", "away_team", "home_score", "away_score",
                 "tournament", "city", "country", "neutral"
-            ]])
+            ]
+            optional_cols = [
+                "fixture_id", "status", "winner_team", "loser_team",
+                "home_winner", "away_winner",
+                "home_penalty_score", "away_penalty_score",
+                "penalty_home_score", "penalty_away_score",
+                "home_penalties", "away_penalties", "source"
+            ]
+            keep_cols = base_cols + [c for c in optional_cols if c in completed_df.columns]
+            completed_df = clean_results_df(completed_df[keep_cols])
 
         return {
             "ok": True,
@@ -5346,12 +5370,143 @@ def official_knockout_initial_teams():
     return set(teams)
 
 
+def _to_boolish(value):
+    """Convierte valores comunes de API/CSV a booleano seguro."""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    s = str(value or "").strip().lower()
+    return s in {"true", "1", "yes", "si", "sí", "winner", "ganador", "won", "w"}
+
+
+def _row_value(row, keys, default=""):
+    """Lee una lista de posibles columnas en Series/dict sin romper si no existen."""
+    for key in keys:
+        try:
+            val = row.get(key, default)
+        except Exception:
+            val = default
+        if val is not None and str(val).strip() != "" and str(val).lower() != "nan":
+            return val
+    return default
+
+
+def _numeric_row_value(row, keys):
+    for key in keys:
+        val = _row_value(row, [key], "")
+        if str(val).strip() == "":
+            continue
+        num = pd.to_numeric(val, errors="coerce")
+        if not pd.isna(num):
+            return float(num)
+    return None
+
+
+def infer_knockout_winner_loser_from_row(row, team_a=None, team_b=None):
+    """
+    Detecta ganador/perdedor real de un partido cargado.
+    Prioridad:
+    1) columnas explícitas winner_team / loser_team / qualified_team;
+    2) banderas home_winner / away_winner de fuentes públicas;
+    3) marcador normal si no hay empate;
+    4) penales si el marcador regular está empatado y existen columnas de penales.
+    """
+    try:
+        h = normalize_team_name(_row_value(row, ["home_team"], ""))
+        a = normalize_team_name(_row_value(row, ["away_team"], ""))
+        if not h or not a:
+            return {"winner": None, "loser": None, "method": "sin equipos"}
+
+        valid_pair = {h, a}
+        if team_a and team_b:
+            ta = normalize_team_name(team_a)
+            tb = normalize_team_name(team_b)
+            if {ta, tb} != valid_pair:
+                return {"winner": None, "loser": None, "method": "otra pareja"}
+
+        # 1) Ganador explícito.
+        winner_raw = _row_value(row, [
+            "winner_team", "winning_team", "winner", "qualified_team", "advancing_team", "advance_team", "team_winner"
+        ], "")
+        if winner_raw:
+            w = normalize_team_name(winner_raw)
+            if w in valid_pair:
+                loser = a if w == h else h
+                return {"winner": w, "loser": loser, "method": "ganador explícito"}
+
+        loser_raw = _row_value(row, ["loser_team", "eliminated_team", "team_loser"], "")
+        if loser_raw:
+            l = normalize_team_name(loser_raw)
+            if l in valid_pair:
+                winner = a if l == h else h
+                return {"winner": winner, "loser": l, "method": "perdedor explícito"}
+
+        # 2) Banderas winner por local/visitante.
+        if _to_boolish(_row_value(row, ["home_winner", "homeWinner", "home_is_winner"], "")):
+            return {"winner": h, "loser": a, "method": "home_winner"}
+        if _to_boolish(_row_value(row, ["away_winner", "awayWinner", "away_is_winner"], "")):
+            return {"winner": a, "loser": h, "method": "away_winner"}
+
+        hs = _numeric_row_value(row, ["home_score", "home_goals", "score_home"])
+        aw = _numeric_row_value(row, ["away_score", "away_goals", "score_away"])
+        if hs is not None and aw is not None:
+            if hs > aw:
+                return {"winner": h, "loser": a, "method": "marcador"}
+            if aw > hs:
+                return {"winner": a, "loser": h, "method": "marcador"}
+
+            # 3) Penales si hay empate en marcador cargado.
+            hp = _numeric_row_value(row, [
+                "home_penalty_score", "penalty_home_score", "home_penalties", "penalties_home", "home_penalty", "pen_home"
+            ])
+            ap = _numeric_row_value(row, [
+                "away_penalty_score", "penalty_away_score", "away_penalties", "penalties_away", "away_penalty", "pen_away"
+            ])
+            if hp is not None and ap is not None:
+                if hp > ap:
+                    return {"winner": h, "loser": a, "method": "penales"}
+                if ap > hp:
+                    return {"winner": a, "loser": h, "method": "penales"}
+
+        return {"winner": None, "loser": None, "method": "sin desempate"}
+    except Exception:
+        return {"winner": None, "loser": None, "method": "error"}
+
+
+def get_manual_eliminated_teams_override():
+    """
+    Respaldo opcional por Secrets para casos en que la fuente pública tarde en publicar desempates.
+    Ejemplo:
+    WORLD_CUP_2026_ELIMINATED_TEAMS = "Japan, Sweden, South Africa"
+    """
+    raw = str(get_config_value("WORLD_CUP_2026_ELIMINATED_TEAMS", "") or "").strip()
+    if not raw:
+        return set()
+    parts = [p.strip() for p in re.split(r"[,;\n|]+", raw) if p.strip()]
+    return {normalize_team_name(p) for p in parts if normalize_team_name(p) in set(WC_2026_TEAMS)}
+
+
+def get_knockout_completed_matches(results_df=None):
+    """Partidos finalizados de fase eliminatoria cargados desde la fecha de inicio R32."""
+    try:
+        wc = strict_completed_worldcup_matches(results_df)
+    except Exception:
+        try:
+            wc = get_worldcup_2026_results(results_df, WC_2026_TEAMS)
+        except Exception:
+            wc = pd.DataFrame()
+    if wc is None or wc.empty or "date" not in wc.columns:
+        return pd.DataFrame()
+    wc = wc.copy()
+    wc["date"] = pd.to_datetime(wc["date"], errors="coerce")
+    return wc[wc["date"] >= pd.Timestamp("2026-06-29")].copy().reset_index(drop=True)
+
+
 def get_played_match_result_between(results_df, team_a, team_b):
-    """Devuelve resultado cargado entre dos equipos si existe; sirve para actualizar eliminatorias reales."""
+    """Devuelve resultado cargado entre dos equipos y detecta ganador real, incluyendo penales/desempates si existen."""
     if results_df is None or results_df.empty or not team_a or not team_b:
         return None
-    a = normalize_team_name(team_a)
-    b = normalize_team_name(team_b)
+    team_a = normalize_team_name(team_a)
+    team_b = normalize_team_name(team_b)
     try:
         wc = get_worldcup_2026_results(results_df, WC_2026_TEAMS)
     except Exception:
@@ -5362,51 +5517,81 @@ def get_played_match_result_between(results_df, team_a, team_b):
         try:
             h = normalize_team_name(row.get("home_team", ""))
             aw = normalize_team_name(row.get("away_team", ""))
-            if set([h, aw]) != set([a, b]):
+            if {h, aw} != {team_a, team_b}:
                 continue
             if pd.isna(row.get("home_score")) or pd.isna(row.get("away_score")):
                 continue
             hs = int(row.get("home_score"))
             gs = int(row.get("away_score"))
-            if h == a:
+            if h == team_a:
                 score_a, score_b = hs, gs
             else:
                 score_a, score_b = gs, hs
-            winner = None
-            loser = None
-            if score_a > score_b:
-                winner, loser = a, b
-            elif score_b > score_a:
-                winner, loser = b, a
-            return {"team_a": a, "team_b": b, "score_a": score_a, "score_b": score_b, "winner": winner, "loser": loser, "date": row.get("date", ""), "source": "resultado cargado"}
+
+            inferred = infer_knockout_winner_loser_from_row(row, team_a, team_b)
+            winner = inferred.get("winner")
+            loser = inferred.get("loser")
+            return {
+                "team_a": team_a,
+                "team_b": team_b,
+                "score_a": score_a,
+                "score_b": score_b,
+                "winner": winner,
+                "loser": loser,
+                "date": row.get("date", ""),
+                "source": f"resultado cargado · {inferred.get('method', '')}".strip(),
+            }
         except Exception:
             continue
     return None
 
 
 def get_worldcup_eliminated_teams(results_df=None):
-    """Equipos eliminados con base en fase de grupos finalizada y resultados de eliminatorias cargados."""
+    """Equipos eliminados con base en fase de grupos finalizada, llaves oficiales y resultados reales cargados."""
     eliminated = set()
     official_32 = official_knockout_initial_teams()
+
+    # Override opcional para casos donde la fuente pública tarde en publicar un desempate/penales.
+    eliminated.update(get_manual_eliminated_teams_override())
+
     try:
         completed = strict_completed_worldcup_matches(results_df) if results_df is not None else pd.DataFrame()
         completed_count = len(completed) if completed is not None else 0
     except Exception:
         completed_count = 0
+
+    # Cuando ya terminó la fase de grupos, los no clasificados a R32 quedan en 0%.
+    # Usamos >=72 porque el formato 2026 tiene 72 partidos de grupos.
     if completed_count >= 72 and len(official_32) >= 32:
         eliminated.update(set(WC_2026_TEAMS) - official_32)
+
+    # Resultados de las llaves oficiales iniciales.
     for match in OFFICIAL_KNOCKOUT_R32_2026:
         played = get_played_match_result_between(results_df, match["team_a"], match["team_b"])
         if played and played.get("loser"):
-            eliminated.add(played["loser"])
+            eliminated.add(normalize_team_name(played["loser"]))
+
+    # Cualquier partido real finalizado desde R32 elimina al perdedor, aunque el bracket proyectado todavía no haya armado esa pareja.
+    knockout_completed = get_knockout_completed_matches(results_df)
+    if knockout_completed is not None and not knockout_completed.empty:
+        for _, row in knockout_completed.iterrows():
+            inferred = infer_knockout_winner_loser_from_row(row)
+            if inferred.get("loser"):
+                eliminated.add(normalize_team_name(inferred["loser"]))
+
+    # Respaldo con el bracket construido: si una ronda posterior ya tiene resultado real, elimina al perdedor real.
     try:
-        proj = build_official_knockout_projection(pd.DataFrame({"equipo": list(WC_2026_TEAMS), "prob_campeon_%": [1]*len(WC_2026_TEAMS)}), results_df=results_df)
+        proj = build_official_knockout_projection(
+            pd.DataFrame({"equipo": list(WC_2026_TEAMS), "prob_campeon_%": [1] * len(WC_2026_TEAMS)}),
+            results_df=results_df,
+        )
         if proj is not None and not proj.empty:
             for _, r in proj.iterrows():
                 if str(r.get("resultado_real", "")).strip() and r.get("perdedor_real"):
                     eliminated.add(normalize_team_name(r.get("perdedor_real")))
     except Exception:
         pass
+
     return {t for t in eliminated if t in set(WC_2026_TEAMS)}
 
 
@@ -5419,13 +5604,15 @@ def apply_elimination_to_champion_probabilities(champion_df, results_df=None):
     if "equipo" not in df.columns or "prob_campeon_%" not in df.columns:
         return df
     df["estado_mundial"] = df["equipo"].apply(lambda t: "Eliminado" if normalize_team_name(t) in eliminated else "Vivo")
+    df["eliminado_detectado"] = df["estado_mundial"].eq("Eliminado")
     df.loc[df["estado_mundial"] == "Eliminado", "prob_campeon_%"] = 0.0
     alive_mask = df["estado_mundial"] != "Eliminado"
     total_alive = float(df.loc[alive_mask, "prob_campeon_%"].sum())
     if total_alive > 0:
         df.loc[alive_mask, "prob_campeon_%"] = df.loc[alive_mask, "prob_campeon_%"] / total_alive * 100.0
-    df["ranking"] = df["prob_campeon_%"].rank(ascending=False, method="first").astype(int)
-    return df.sort_values(["prob_campeon_%", "estado_mundial"], ascending=[False, True]).reset_index(drop=True)
+    df = df.sort_values(["prob_campeon_%", "estado_mundial"], ascending=[False, True]).reset_index(drop=True)
+    df["ranking"] = np.arange(1, len(df) + 1)
+    return df
 
 
 def apply_elimination_to_mc_probabilities(mc_df, results_df=None):
@@ -5439,8 +5626,8 @@ def apply_elimination_to_mc_probabilities(mc_df, results_df=None):
         total = float(df["prob_campeon_montecarlo_%"].sum())
         if total > 0:
             df["prob_campeon_montecarlo_%"] = df["prob_campeon_montecarlo_%"] / total * 100.0
-        df["ranking_mc"] = df["prob_campeon_montecarlo_%"].rank(ascending=False, method="first").astype(int)
         df = df.sort_values("prob_campeon_montecarlo_%", ascending=False).reset_index(drop=True)
+        df["ranking_mc"] = np.arange(1, len(df) + 1)
     return df
 
 def get_worldcup_group_tables_from_calendar(results_df=None):
@@ -10152,10 +10339,14 @@ def streamlit_app():
 
         st.markdown("### Ranking base de fuerza")
         total_prob = champion_df["prob_campeon_%"].sum()
-        ctop1, ctop2, ctop3 = st.columns(3)
+        eliminated_count = int((champion_df.get("estado_mundial", pd.Series(dtype=str)) == "Eliminado").sum()) if "estado_mundial" in champion_df.columns else 0
+        alive_count = int(len(champion_df) - eliminated_count)
+        ctop1, ctop2, ctop3, ctop4 = st.columns(4)
         ctop1.metric("Equipos evaluados", f"{len(champion_df)}")
-        ctop2.metric("Suma de probabilidades", f"{total_prob:.2f}%")
-        ctop3.metric("Favorito base", champion_df.iloc[0]["equipo_es"])
+        ctop2.metric("Equipos vivos", f"{alive_count}")
+        ctop3.metric("Eliminados en 0%", f"{eliminated_count}")
+        ctop4.metric("Suma de probabilidades", f"{total_prob:.2f}%")
+        st.caption("Control de consistencia: cualquier equipo detectado como eliminado por grupo, llave oficial, resultado cargado o desempate explícito queda automáticamente con 0%.")
 
         st.caption(
             "Este ranking reparte 100% según fuerza actual. Debajo puedes correr una simulación Monte Carlo "
@@ -10165,14 +10356,18 @@ def streamlit_app():
         col_prob_1, col_prob_2 = st.columns([1.05, 1])
 
         with col_prob_1:
-            show_df = champion_df[[
-                "ranking", "equipo_es", "prob_campeon_%", "elo",
+            base_cols = [
+                "ranking", "equipo_es", "estado_mundial", "prob_campeon_%", "elo",
                 "mundial_PJ", "mundial_PTS", "mundial_DG",
                 "gf_last10", "ga_last10", "points_last10"
-            ]].copy()
+            ]
+            for c in base_cols:
+                if c not in champion_df.columns:
+                    champion_df[c] = "" if c == "estado_mundial" else 0
+            show_df = champion_df[base_cols].copy()
 
             show_df.columns = [
-                "Ranking", "Equipo", "Prob. campeón base (%)", "Elo",
+                "Ranking", "Equipo", "Estado", "Prob. campeón base (%)", "Elo",
                 "PJ Mundial", "PTS Mundial", "DG Mundial",
                 "GF últimos 10", "GC últimos 10", "Puntos prom. últimos 10"
             ]
