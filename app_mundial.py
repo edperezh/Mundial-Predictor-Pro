@@ -8974,6 +8974,275 @@ def parse_access_codes(raw_codes):
     return [x.strip() for x in str(raw_codes).replace("\n", ",").split(",") if x.strip()]
 
 
+
+# ============================================================
+# PAYPAL CHECKOUT API - REGISTRO AUTOMÁTICO
+# ============================================================
+
+def paypal_settings():
+    """
+    Configuración para PayPal Checkout API.
+    Para envío automático de códigos NO basta un Payment Link estático.
+    Se requiere crear/capturar una orden con PAYPAL_CLIENT_ID y PAYPAL_CLIENT_SECRET.
+    """
+    return {
+        "client_id": str(get_config_value("PAYPAL_CLIENT_ID", "") or "").strip(),
+        "client_secret": str(get_config_value("PAYPAL_CLIENT_SECRET", "") or "").strip(),
+        "currency": str(get_config_value("PAYPAL_CURRENCY", "USD") or "USD").strip().upper(),
+        "price_usd": float(str(get_config_value("PAYPAL_PRICE_USD", get_config_value("PRICE_USD", "5.99"))).replace(",", ".") or 5.99),
+        "public_url": str(get_config_value("APP_PUBLIC_URL", "https://predictor-mundial-2026-edp.streamlit.app/") or "").strip().rstrip("/"),
+        "sandbox": str(get_config_value("PAYPAL_SANDBOX", "false")).lower().strip() in ["1", "true", "yes", "si", "sí", "on"],
+        "manual_link": str(get_config_value("PAYMENT_LINK", "") or "").strip(),
+    }
+
+
+def paypal_is_configured():
+    cfg = paypal_settings()
+    return bool(cfg.get("client_id") and cfg.get("client_secret"))
+
+
+def paypal_api_base_url():
+    return "https://api-m.sandbox.paypal.com" if paypal_settings().get("sandbox") else "https://api-m.paypal.com"
+
+
+def get_paypal_access_token():
+    cfg = paypal_settings()
+    if not cfg.get("client_id") or not cfg.get("client_secret"):
+        return False, "PAYPAL_CLIENT_ID y PAYPAL_CLIENT_SECRET no están configurados.", ""
+    try:
+        res = requests.post(
+            f"{paypal_api_base_url()}/v1/oauth2/token",
+            auth=(cfg["client_id"], cfg["client_secret"]),
+            headers={"Accept": "application/json", "Accept-Language": "en_US"},
+            data={"grant_type": "client_credentials"},
+            timeout=25,
+        )
+        if res.status_code not in [200, 201]:
+            return False, f"No se pudo autenticar con PayPal: {res.status_code} {res.text[:180]}", ""
+        token = res.json().get("access_token", "")
+        if not token:
+            return False, "PayPal no devolvió access_token.", ""
+        return True, "Token PayPal obtenido.", token
+    except Exception as e:
+        return False, f"Error autenticando PayPal: {str(e)[:180]}", ""
+
+
+def build_paypal_return_url(kind="success"):
+    cfg = paypal_settings()
+    base = cfg.get("public_url") or "https://predictor-mundial-2026-edp.streamlit.app"
+    return f"{base}/?provider=paypal&checkout={kind}"
+
+
+def create_paypal_order(email, price_amount=None, coupon_code=""):
+    """
+    Crea una orden PayPal y devuelve el approve_url.
+    El comprador vuelve a la app con ?provider=paypal&token=ORDER_ID.
+    La app captura la orden antes de registrar el acceso.
+    """
+    cfg = paypal_settings()
+    email = normalize_email(email)
+    if not is_valid_email(email):
+        return False, "Correo inválido.", ""
+
+    ok, msg, access_token = get_paypal_access_token()
+    if not ok:
+        return False, msg, ""
+
+    currency = cfg.get("currency", "USD") or "USD"
+    amount = float(price_amount if price_amount is not None else cfg.get("price_usd", 5.99))
+    coupon_code = str(coupon_code or "").strip().upper()
+    now = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    nonce = secrets.token_hex(4)
+    external_reference = f"mpp|{hash_text(email)[:12]}|{coupon_code or 'NOCOUPON'}|{now}|{nonce}"
+
+    body = {
+        "intent": "CAPTURE",
+        "purchase_units": [
+            {
+                "reference_id": external_reference,
+                "custom_id": external_reference,
+                "description": "Mundial Predictor Pro - Digital Access",
+                "amount": {
+                    "currency_code": currency,
+                    "value": f"{amount:.2f}",
+                },
+            }
+        ],
+        "payer": {"email_address": email},
+        "application_context": {
+            "brand_name": str(get_config_value("APP_BRAND_NAME", "Mundial Predictor Pro"))[:127],
+            "landing_page": "LOGIN",
+            "user_action": "PAY_NOW",
+            "return_url": build_paypal_return_url("success"),
+            "cancel_url": build_paypal_return_url("cancel"),
+        },
+    }
+
+    try:
+        res = requests.post(
+            f"{paypal_api_base_url()}/v2/checkout/orders",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=body,
+            timeout=25,
+        )
+        if res.status_code not in [200, 201]:
+            return False, f"No se pudo crear orden PayPal: {res.status_code} {res.text[:180]}", ""
+        data = res.json()
+        order_id = data.get("id", "")
+        approve_url = ""
+        for link in data.get("links", []):
+            if str(link.get("rel", "")).lower() == "approve":
+                approve_url = link.get("href", "")
+                break
+        if not approve_url:
+            return False, "PayPal no devolvió enlace de aprobación.", ""
+        log_access_event(
+            "paypal_order_created",
+            email=email,
+            details={"order_id": order_id, "amount": amount, "currency": currency, "coupon": coupon_code, "external_reference": external_reference},
+        )
+        return True, "Orden PayPal creada correctamente.", approve_url
+    except Exception as e:
+        return False, f"Error creando orden PayPal: {str(e)[:180]}", ""
+
+
+def paypal_capture_order(order_id):
+    """Captura una orden PayPal aprobada por el comprador y normaliza los datos para el registro interno."""
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        return False, "No llegó token/order_id de PayPal.", None
+
+    # Evita intentar capturar de nuevo si ya registramos ese pago.
+    try:
+        init_access_control_db()
+        with sqlite3.connect(ACCESS_CONTROL_DB_PATH, timeout=10) as con:
+            row = con.execute(
+                "SELECT email, amount, currency FROM payments WHERE provider=? AND provider_payment_id=? LIMIT 1",
+                ("paypal", order_id),
+            ).fetchone()
+        if row:
+            return True, "Orden PayPal ya estaba registrada.", {
+                "status": "approved",
+                "transaction_amount": float(row[1] or 0),
+                "currency_id": row[2] or paypal_settings().get("currency", "USD"),
+                "external_reference": "",
+                "payer": {"email": row[0]},
+                "payment_method_id": "paypal",
+                "payment_type_id": "paypal",
+            }
+    except Exception:
+        pass
+
+    ok, msg, access_token = get_paypal_access_token()
+    if not ok:
+        return False, msg, None
+
+    try:
+        res = requests.post(
+            f"{paypal_api_base_url()}/v2/checkout/orders/{order_id}/capture",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=30,
+        )
+        if res.status_code not in [200, 201]:
+            return False, f"No se pudo capturar PayPal: {res.status_code} {res.text[:180]}", None
+        data = res.json()
+        status = str(data.get("status", "")).upper()
+        if status != "COMPLETED":
+            return False, f"La orden PayPal no quedó completada. Estado: {status or 'desconocido'}", data
+
+        payer = data.get("payer") or {}
+        payer_email = payer.get("email_address") or ""
+        amount = 0.0
+        currency = paypal_settings().get("currency", "USD")
+        external_reference = ""
+        capture_id = order_id
+        for pu in data.get("purchase_units", []):
+            external_reference = pu.get("custom_id") or pu.get("reference_id") or external_reference
+            payments = pu.get("payments") or {}
+            captures = payments.get("captures") or []
+            if captures:
+                cap = captures[0]
+                capture_id = cap.get("id") or capture_id
+                cap_amount = cap.get("amount") or {}
+                amount = float(cap_amount.get("value") or amount or 0)
+                currency = cap_amount.get("currency_code") or currency
+                external_reference = cap.get("custom_id") or external_reference
+
+        payment_data = {
+            "status": "approved",
+            "transaction_amount": amount,
+            "total_paid_amount": amount,
+            "currency_id": currency,
+            "external_reference": external_reference,
+            "payer": {"email": payer_email},
+            "payment_method_id": "paypal",
+            "payment_type_id": "paypal",
+            "capture_id": capture_id,
+        }
+        return True, "Pago PayPal capturado.", payment_data
+    except Exception as e:
+        return False, f"Error capturando PayPal: {str(e)[:180]}", None
+
+
+def handle_paypal_return():
+    """Procesa retorno de PayPal, captura pago aprobado, registra cliente y envía código dinámico."""
+    if not STREAMLIT_OK or not paypal_is_configured():
+        return
+
+    params = get_query_params_safe()
+    provider = str(query_value(params, "provider", "")).lower()
+    checkout = str(query_value(params, "checkout", "")).lower()
+    order_id = query_value(params, "token", "") or query_value(params, "order_id", "")
+
+    if provider != "paypal" and not order_id:
+        return
+    if checkout in ["cancel", "failure"]:
+        st.warning("El pago con PayPal fue cancelado o no se completó. Puedes intentarlo nuevamente.")
+        return
+    if not order_id:
+        return
+
+    flag_key = f"paypal_payment_processed_{order_id}"
+    if st.session_state.get(flag_key):
+        return
+
+    with st.spinner("Verificando pago con PayPal..."):
+        ok, msg, payment_data = paypal_capture_order(order_id)
+        if not ok:
+            st.warning(msg)
+            return
+
+        registered, reg_msg = register_verified_payment("paypal", order_id, payment_data)
+        if not registered:
+            st.error(reg_msg)
+            return
+
+        email = extract_email_from_payment(payment_data)
+        token = generate_login_token(email, purpose="paid")
+        sent, email_msg = send_login_token_email(email, token, purpose="paid")
+
+        st.session_state[flag_key] = True
+        if sent:
+            st.success("Pago PayPal aprobado. Tu correo fue registrado automáticamente y te enviamos un código de ingreso.")
+            st.info(f"Revisa el correo: {mask_email(email)}")
+        else:
+            st.success("Pago PayPal aprobado y correo registrado automáticamente.")
+            st.error(email_msg)
+        track_analytics_event(
+            "paypal_payment_processed",
+            language=st.session_state.get("app_language_name", ""),
+            access_granted=True,
+            details={"order_id": order_id},
+        )
+
 def monetization_settings():
     """
     Configuración por secrets/env:
@@ -9000,6 +9269,7 @@ def monetization_settings():
         "price_usd": price_usd,
         "brand_name": brand_name,
         "support_contact": support_contact,
+        "paypal_configured": paypal_is_configured(),
     }
 
 
@@ -9019,6 +9289,7 @@ def render_inline_purchase_section(default_email="", coupon_code=""):
     )
     if mercadopago_is_configured():
         price = mp_cfg["coupon_price"] if coupon else mp_cfg["base_price"]
+        st.markdown("#### Mercado Pago")
         purchase_email_inline = st.text_input(
             "Correo para recibir el link de Mercado Pago",
             value="",
@@ -9050,16 +9321,57 @@ def render_inline_purchase_section(default_email="", coupon_code=""):
                     st.error(msg)
         checkout_url = st.session_state.get("inline_mp_checkout_url", "")
         if checkout_url:
-            st.link_button("Abrir checkout seguro", checkout_url, type="primary", use_container_width=True)
+            st.link_button("Abrir checkout seguro Mercado Pago", checkout_url, type="primary", use_container_width=True)
+
+    if paypal_is_configured():
+        st.divider()
+        paypal_cfg = paypal_settings()
+        paypal_price = paypal_cfg["price_usd"]
+        st.markdown("#### PayPal / tarjeta internacional")
+        paypal_email_inline = st.text_input(
+            "Correo para recibir el código después de pagar con PayPal",
+            value="",
+            placeholder="tu_correo@ejemplo.com",
+            key="inline_paypal_purchase_email_v1"
+        )
+        st.caption(f"Precio en checkout: **{format_money(paypal_price, paypal_cfg['currency'])}**")
+        if st.button("Generar checkout PayPal", type="primary", use_container_width=True, key="inline_generate_paypal_order"):
+            email = normalize_email(paypal_email_inline)
+            if not is_valid_email(email):
+                st.error("Escribe un correo válido para asociar el acceso.")
+            else:
+                ok, msg, approve_url = create_paypal_order(
+                    email=email,
+                    price_amount=paypal_price,
+                    coupon_code=coupon["code"] if coupon else ""
+                )
+                if ok:
+                    st.session_state["inline_paypal_approve_url"] = approve_url
+                    track_analytics_event(
+                        "paypal_checkout_created_after_trial",
+                        language=st.session_state.get("app_language_name", ""),
+                        access_granted=False,
+                        admin_mode=False,
+                        details={"provider": "paypal", "price": paypal_price, "currency": paypal_cfg["currency"]}
+                    )
+                    st.success("Checkout PayPal creado. Ábrelo para completar la compra.")
+                else:
+                    st.error(msg)
+        approve_url = st.session_state.get("inline_paypal_approve_url", "")
+        if approve_url:
+            st.link_button("Abrir checkout PayPal", approve_url, type="primary", use_container_width=True)
+            st.info("Después del pago aprobado, PayPal te devolverá a esta página. La app verificará el pago, registrará tu correo y enviará el código de ingreso.")
     else:
         payment_link = settings.get("payment_link", "")
-        support = settings.get("support_contact", "")
         if payment_link:
-            st.link_button("Abrir enlace de pago", payment_link, type="primary", use_container_width=True)
-        else:
-            st.warning("Mercado Pago aún no está configurado. Puedes usar Nequi si aparece habilitado abajo o contactar soporte.")
-        if support:
-            st.caption(f"Soporte: {support}")
+            st.divider()
+            st.markdown("#### PayPal manual")
+            st.warning("Este enlace manual no activa el acceso automáticamente. Para automatizar PayPal configura PAYPAL_CLIENT_ID y PAYPAL_CLIENT_SECRET.")
+            st.link_button("Abrir enlace manual de PayPal", payment_link, type="secondary", use_container_width=True)
+
+    support = settings.get("support_contact", "")
+    if support:
+        st.caption(f"Soporte: {support}")
 
     nequi_cfg = nequi_settings()
     if nequi_is_configured():
@@ -9098,6 +9410,7 @@ def render_public_landing(settings):
     )
     init_access_control_db()
     handle_mercadopago_return()
+    handle_paypal_return()
 
     brand = settings["brand_name"]
     payment_link = settings["payment_link"]
@@ -9329,6 +9642,60 @@ def render_public_landing(settings):
                     "La app verificará el pago, registrará tu correo automáticamente y te enviará el código de ingreso."
                 )
 
+        if paypal_is_configured():
+            st.divider()
+            paypal_cfg = paypal_settings()
+            paypal_price = paypal_cfg["price_usd"]
+            st.markdown("#### PayPal / tarjeta internacional")
+            st.caption(
+                "PayPal funciona con checkout automático: después del pago aprobado, "
+                "la app verifica la orden, registra el correo y envía el código dinámico."
+            )
+            paypal_email = st.text_input(
+                "Correo para recibir el código después de pagar con PayPal",
+                value="",
+                placeholder="tu_correo@ejemplo.com",
+                key="paypal_purchase_email_v1"
+            )
+            st.caption(f"Precio en checkout: **{format_money(paypal_price, paypal_cfg['currency'])}**")
+            if st.button("Generar checkout PayPal", type="primary", use_container_width=True, key="paypal_generate_order"):
+                email = normalize_email(paypal_email)
+                if not is_valid_email(email):
+                    st.error("Escribe un correo válido para asociar el acceso.")
+                else:
+                    ok, msg, approve_url = create_paypal_order(
+                        email=email,
+                        price_amount=paypal_price,
+                        coupon_code=coupon["code"] if coupon else ""
+                    )
+                    if ok:
+                        st.session_state["paypal_approve_url"] = approve_url
+                        track_analytics_event(
+                            "paypal_checkout_created",
+                            language=st.session_state.get("app_language_name", ""),
+                            access_granted=False,
+                            admin_mode=False,
+                            details={"provider": "paypal", "price": paypal_price, "currency": paypal_cfg["currency"]}
+                        )
+                        st.success("Checkout PayPal creado. Ábrelo para completar la compra.")
+                    else:
+                        st.error(msg)
+            paypal_approve_url = st.session_state.get("paypal_approve_url", "")
+            if paypal_approve_url:
+                st.link_button("Abrir checkout PayPal", paypal_approve_url, type="primary", use_container_width=True)
+                st.info(
+                    "Después del pago aprobado, PayPal te devolverá a esta página. "
+                    "La app verificará el pago, registrará tu correo automáticamente y te enviará el código de ingreso."
+                )
+        elif payment_link:
+            st.divider()
+            st.markdown("#### PayPal manual")
+            st.warning(
+                "Este enlace manual no puede enviar códigos automáticamente. "
+                "Para automatizar PayPal configura PAYPAL_CLIENT_ID y PAYPAL_CLIENT_SECRET."
+            )
+            st.link_button("Abrir enlace manual PayPal", payment_link, type="secondary", use_container_width=True)
+
         nequi_available = nequi_is_configured()
         if nequi_available:
             st.divider()
@@ -9355,7 +9722,7 @@ def render_public_landing(settings):
                 else:
                     st.error(msg)
 
-        if (not mercadopago_is_configured()) and payment_link:
+        if (not mercadopago_is_configured()) and (not paypal_is_configured()) and payment_link:
             st.markdown("#### Enlace de pago manual")
             if st.button("Registrar intención de compra", use_container_width=True, help="Cuenta el clic y muestra el botón de pago."):
                 track_analytics_event(
@@ -9367,7 +9734,7 @@ def render_public_landing(settings):
                 )
                 st.info("Abre el enlace de pago. Si el proveedor no devuelve confirmación automática, el acceso se activa manualmente.")
             st.link_button("Abrir enlace de pago", payment_link, type="primary", use_container_width=True)
-        elif (not mercadopago_is_configured()) and (not nequi_available):
+        elif (not mercadopago_is_configured()) and (not paypal_is_configured()) and (not nequi_available):
             st.warning(
                 "Aún no configuraste un enlace de pago, MERCADOPAGO_ACCESS_TOKEN ni NEQUI_PHONE. "
                 "Puedes registrar clientes manualmente desde el panel admin."
