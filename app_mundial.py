@@ -1881,6 +1881,7 @@ def load_stable_artifact():
 
 
 
+
 FASES_MUNDIAL_2026 = [
     "Fase de grupos",
     "Dieciseisavos de final",
@@ -1895,13 +1896,15 @@ def detectar_fase_mundial_2026(match_number=None, round_name="", fecha=None):
     """
     Detecta la fase oficial del Mundial 2026.
     Prioridad:
-    1. Número oficial del partido.
-    2. Nombre de ronda recibido por API/calendario.
+    1. Número oficial del partido: P1-P104.
+    2. Nombre de ronda: Round of 32, Round of 16, Quarter-final, etc.
+    3. Fecha oficial del calendario.
     """
 
+    # 1) Número oficial del partido
     if match_number is not None:
         try:
-            n = int(str(match_number).replace("P", "").strip())
+            n = int(str(match_number).replace("P", "").replace("Match", "").strip())
             if 1 <= n <= 72:
                 return "Fase de grupos"
             if 73 <= n <= 88:
@@ -1919,22 +1922,48 @@ def detectar_fase_mundial_2026(match_number=None, round_name="", fecha=None):
         except Exception:
             pass
 
+    # 2) Nombre de ronda recibido por API / ESPN / calendario
     r = str(round_name or "").lower()
 
     if "group" in r or "grupo" in r:
         return "Fase de grupos"
-    if "round of 32" in r or "r32" in r or "dieciseis" in r or "32" in r:
+    if "round of 32" in r or "last 32" in r or "r32" in r or "dieciseis" in r or "1/16" in r:
         return "Dieciseisavos de final"
-    if "round of 16" in r or "r16" in r or "octavos" in r or "16" in r:
+    if "round of 16" in r or "last 16" in r or "r16" in r or "octavos" in r or "1/8" in r:
         return "Octavos de final"
     if "quarter" in r or "cuartos" in r:
         return "Cuartos de final"
     if "semi" in r:
         return "Semifinales"
-    if "third" in r or "tercer" in r:
+    if "third" in r or "tercer" in r or "3rd" in r:
         return "Tercer puesto"
     if "final" in r:
         return "Final"
+
+    # 3) Fecha oficial como respaldo
+    if fecha is not None:
+        try:
+            from datetime import datetime, date
+
+            s = str(fecha)[:10]
+            d = datetime.fromisoformat(s).date()
+
+            if date(2026, 6, 11) <= d <= date(2026, 6, 27):
+                return "Fase de grupos"
+            if date(2026, 6, 28) <= d <= date(2026, 7, 3):
+                return "Dieciseisavos de final"
+            if date(2026, 7, 4) <= d <= date(2026, 7, 7):
+                return "Octavos de final"
+            if date(2026, 7, 9) <= d <= date(2026, 7, 11):
+                return "Cuartos de final"
+            if date(2026, 7, 14) <= d <= date(2026, 7, 15):
+                return "Semifinales"
+            if d == date(2026, 7, 18):
+                return "Tercer puesto"
+            if d == date(2026, 7, 19):
+                return "Final"
+        except Exception:
+            pass
 
     return "Fase de grupos"
 
@@ -10237,10 +10266,67 @@ def streamlit_app():
         st.markdown("**Contexto competitivo**")
         comp_col1, comp_col2, comp_col3 = st.columns(3)
         with comp_col1:
+            fase_opciones = FASES_MUNDIAL_2026
+
+            fixture_info_stage = auto_sources.get("fixture_info") if isinstance(auto_sources, dict) else None
+
+            if not isinstance(fixture_info_stage, dict):
+
+                fixture_info_stage = {}
+
+
+            round_name_auto = (
+
+                fixture_info_stage.get("round")
+
+                or fixture_info_stage.get("stage")
+
+                or fixture_info_stage.get("league_round")
+
+                or fixture_info_stage.get("phase")
+
+                or ""
+
+            )
+
+
+            match_number_auto = (
+
+                fixture_info_stage.get("match_number")
+
+                or fixture_info_stage.get("match_no")
+
+                or fixture_info_stage.get("number")
+
+                or None
+
+            )
+
+
+            stage_auto = detectar_fase_mundial_2026(
+
+                match_number=match_number_auto,
+
+                round_name=round_name_auto,
+
+                fecha=match_date
+
+            )
+
+
+            stage_index = fase_opciones.index(stage_auto) if stage_auto in fase_opciones else 0
+
+
             stage = st.selectbox(
+
                 "Fase del torneo",
-                ["Fase de grupos", "Dieciseisavos de final", "Octavos de final", "Cuartos de final", "Semifinales", "Tercer puesto", "Final"],
-                index=0
+
+                fase_opciones,
+
+                index=stage_index,
+
+                help=f"Fase sugerida automáticamente: {stage_auto}"
+
             )
         with comp_col2:
             urgency_a = st.slider(f"Necesidad de ganar {team_a}", 0, 10, 5)
