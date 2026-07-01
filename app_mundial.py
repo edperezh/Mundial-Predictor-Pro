@@ -1880,6 +1880,65 @@ def load_stable_artifact():
         return None
 
 
+
+FASES_MUNDIAL_2026 = [
+    "Fase de grupos",
+    "Dieciseisavos de final",
+    "Octavos de final",
+    "Cuartos de final",
+    "Semifinales",
+    "Tercer puesto",
+    "Final",
+]
+
+def detectar_fase_mundial_2026(match_number=None, round_name="", fecha=None):
+    """
+    Detecta la fase oficial del Mundial 2026.
+    Prioridad:
+    1. Número oficial del partido.
+    2. Nombre de ronda recibido por API/calendario.
+    """
+
+    if match_number is not None:
+        try:
+            n = int(str(match_number).replace("P", "").strip())
+            if 1 <= n <= 72:
+                return "Fase de grupos"
+            if 73 <= n <= 88:
+                return "Dieciseisavos de final"
+            if 89 <= n <= 96:
+                return "Octavos de final"
+            if 97 <= n <= 100:
+                return "Cuartos de final"
+            if 101 <= n <= 102:
+                return "Semifinales"
+            if n == 103:
+                return "Tercer puesto"
+            if n == 104:
+                return "Final"
+        except Exception:
+            pass
+
+    r = str(round_name or "").lower()
+
+    if "group" in r or "grupo" in r:
+        return "Fase de grupos"
+    if "round of 32" in r or "r32" in r or "dieciseis" in r or "32" in r:
+        return "Dieciseisavos de final"
+    if "round of 16" in r or "r16" in r or "octavos" in r or "16" in r:
+        return "Octavos de final"
+    if "quarter" in r or "cuartos" in r:
+        return "Cuartos de final"
+    if "semi" in r:
+        return "Semifinales"
+    if "third" in r or "tercer" in r:
+        return "Tercer puesto"
+    if "final" in r:
+        return "Final"
+
+    return "Fase de grupos"
+
+
 def is_final_match_status(status):
     """Normaliza estados finalizados de API, calendario interno y CSV manual."""
     s = str(status or "").strip().lower()
@@ -5344,20 +5403,20 @@ OFFICIAL_KNOCKOUT_R32_2026 = [
 ]
 
 OFFICIAL_KNOCKOUT_NEXT_2026 = {
-    "P89": {"fase": "Octavos", "side": "left",  "from": ["P74", "P77"], "date": "2026-07-04", "time": "16:00"},
-    "P90": {"fase": "Octavos", "side": "left",  "from": ["P73", "P75"], "date": "2026-07-04", "time": "12:00"},
-    "P93": {"fase": "Octavos", "side": "left",  "from": ["P83", "P84"], "date": "2026-07-06", "time": "14:00"},
-    "P94": {"fase": "Octavos", "side": "left",  "from": ["P81", "P82"], "date": "2026-07-06", "time": "19:00"},
-    "P91": {"fase": "Octavos", "side": "right", "from": ["P76", "P78"], "date": "2026-07-05", "time": "15:00"},
-    "P92": {"fase": "Octavos", "side": "right", "from": ["P79", "P80"], "date": "2026-07-05", "time": "19:00"},
-    "P95": {"fase": "Octavos", "side": "right", "from": ["P86", "P88"], "date": "2026-07-07", "time": "11:00"},
-    "P96": {"fase": "Octavos", "side": "right", "from": ["P85", "P87"], "date": "2026-07-07", "time": "15:00"},
-    "P97": {"fase": "Cuartos", "side": "left",  "from": ["P89", "P90"], "date": "2026-07-09", "time": "15:00"},
-    "P98": {"fase": "Cuartos", "side": "left",  "from": ["P93", "P94"], "date": "2026-07-10", "time": "14:00"},
-    "P99": {"fase": "Cuartos", "side": "right", "from": ["P91", "P92"], "date": "2026-07-09", "time": "18:00"},
-    "P100": {"fase": "Cuartos", "side": "right", "from": ["P95", "P96"], "date": "2026-07-11", "time": "20:00"},
-    "P101": {"fase": "Semifinal", "side": "left",  "from": ["P97", "P98"], "date": "2026-07-14", "time": "14:00"},
-    "P102": {"fase": "Semifinal", "side": "right", "from": ["P99", "P100"], "date": "2026-07-15", "time": "14:00"},
+    "P89": {"fase": "Octavos de final", "side": "left",  "from": ["P74", "P77"], "date": "2026-07-04", "time": "16:00"},
+    "P90": {"fase": "Octavos de final", "side": "left",  "from": ["P73", "P75"], "date": "2026-07-04", "time": "12:00"},
+    "P93": {"fase": "Octavos de final", "side": "left",  "from": ["P83", "P84"], "date": "2026-07-06", "time": "14:00"},
+    "P94": {"fase": "Octavos de final", "side": "left",  "from": ["P81", "P82"], "date": "2026-07-06", "time": "19:00"},
+    "P91": {"fase": "Octavos de final", "side": "right", "from": ["P76", "P78"], "date": "2026-07-05", "time": "15:00"},
+    "P92": {"fase": "Octavos de final", "side": "right", "from": ["P79", "P80"], "date": "2026-07-05", "time": "19:00"},
+    "P95": {"fase": "Octavos de final", "side": "right", "from": ["P86", "P88"], "date": "2026-07-07", "time": "11:00"},
+    "P96": {"fase": "Octavos de final", "side": "right", "from": ["P85", "P87"], "date": "2026-07-07", "time": "15:00"},
+    "P97": {"fase": "Cuartos de final", "side": "left",  "from": ["P89", "P90"], "date": "2026-07-09", "time": "15:00"},
+    "P98": {"fase": "Cuartos de final", "side": "left",  "from": ["P93", "P94"], "date": "2026-07-10", "time": "14:00"},
+    "P99": {"fase": "Cuartos de final", "side": "right", "from": ["P91", "P92"], "date": "2026-07-09", "time": "18:00"},
+    "P100": {"fase": "Cuartos de final", "side": "right", "from": ["P95", "P96"], "date": "2026-07-11", "time": "20:00"},
+    "P101": {"fase": "Semifinales", "side": "left",  "from": ["P97", "P98"], "date": "2026-07-14", "time": "14:00"},
+    "P102": {"fase": "Semifinales", "side": "right", "from": ["P99", "P100"], "date": "2026-07-15", "time": "14:00"},
     "P104": {"fase": "Final", "side": "center", "from": ["P101", "P102"], "date": "2026-07-19", "time": "14:00"},
     "P103": {"fase": "Tercer puesto", "side": "center", "from": ["P101", "P102"], "date": "2026-07-18", "time": "16:00", "losers": True},
 }
@@ -5823,7 +5882,7 @@ def build_official_knockout_projection(champion_df, results_df=None, training_re
     for i, match in enumerate(OFFICIAL_KNOCKOUT_R32_2026, start=1):
         decide_match(match["slot"], "Dieciseisavos", match["side"], match["team_a"], match["team_b"], match.get("date", ""), match.get("time", ""), 1, i)
 
-    round_order = {"Octavos": 2, "Cuartos": 3, "Semifinal": 4, "Tercer puesto": 5, "Final": 6}
+    round_order = {"Octavos de final": 2, "Cuartos de final": 3, "Semifinales": 4, "Tercer puesto": 5, "Final": 6}
     for slot in ["P89", "P90", "P93", "P94", "P91", "P92", "P95", "P96", "P97", "P98", "P99", "P100", "P101", "P102", "P103", "P104"]:
         meta = OFFICIAL_KNOCKOUT_NEXT_2026[slot]
         f1, f2 = meta["from"]
@@ -5861,7 +5920,7 @@ def render_complete_knockout_html(bracket_df):
           </div>
         """
 
-    layout = [("Dieciseisavos", "left", "Dieciseisavos"), ("Octavos", "left", "Octavos"), ("Cuartos", "left", "Cuartos"), ("Semifinal", "left", "Semifinal"), ("Final", "center", "Final"), ("Semifinal", "right", "Semifinal"), ("Cuartos", "right", "Cuartos"), ("Octavos", "right", "Octavos"), ("Dieciseisavos", "right", "Dieciseisavos")]
+    layout = [("Dieciseisavos de final", "left", "Dieciseisavos de final"), ("Octavos de final", "left", "Octavos de final"), ("Cuartos de final", "left", "Cuartos de final"), ("Semifinales", "left", "Semifinales"), ("Final", "center", "Final"), ("Semifinales", "right", "Semifinales"), ("Cuartos de final", "right", "Cuartos de final"), ("Octavos de final", "right", "Octavos de final"), ("Dieciseisavos de final", "right", "Dieciseisavos de final")]
     columns = []
     for fase, side, label in layout:
         d = bracket_df[(bracket_df["fase"] == fase) & (bracket_df["side"] == side)].copy().sort_values("partido", ascending=True)
@@ -10180,7 +10239,7 @@ def streamlit_app():
         with comp_col1:
             stage = st.selectbox(
                 "Fase del torneo",
-                ["Fase de grupos", "Octavos", "Cuartos", "Semifinal", "Final"],
+                ["Fase de grupos", "Dieciseisavos de final", "Octavos de final", "Cuartos de final", "Semifinales", "Tercer puesto", "Final"],
                 index=0
             )
         with comp_col2:
