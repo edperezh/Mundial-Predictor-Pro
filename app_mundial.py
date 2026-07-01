@@ -10102,8 +10102,8 @@ def streamlit_app():
                 "La app intentó resolverla por internet; si no hay fuente exacta, usa una sede de referencia."
             )
 
-        usar_auto_web = st.checkbox("Usar variables externas desde internet (más lento)", value=False, help="Actívalo solo si necesitas clima/noticias/API en vivo. En modo rápido la predicción usa datos guardados y variables locales.")
-        force_context_update = st.checkbox("Forzar actualización de variables externas", value=False)
+        usar_auto_web = st.checkbox("Usar variables externas desde internet (más lento)", value=True, help="Actívalo solo si necesitas clima/noticias/API en vivo. En modo rápido la predicción usa datos guardados y variables locales.")
+        force_context_update = st.checkbox("Forzar actualización de variables externas", value=True)
 
         if usar_auto_web:
             with st.spinner("Consultando variables externas. Esto puede tardar más que el modo rápido..."):
